@@ -81,7 +81,12 @@ def main() -> None:
                 face_for_overlay = primary_face
                 status_face = primary_face
 
-                dwell_time = now - live_face_started_at
+                live_start = live_face_started_at
+                if live_start is not None:
+                    assert live_start is not None
+                    dwell_time = now - live_start
+                else:
+                    dwell_time = 0.0
                 tracking_ready = primary_face.metrics["tracking_confidence"] >= 0.6
                 mode = "tracking" if dwell_time >= ENGAGE_AFTER_SECONDS and tracking_ready else "acquiring"
             else:
@@ -184,8 +189,12 @@ def _draw_signal_strip(
     accent: tuple[int, int, int],
 ) -> None:
     metrics = face.metrics
+    age_value = f"~{face.age_years:0.0f}" if face.age_years is not None else "--"
+    age_label = face.age_label or "--"
     labels = (
         f"Yuz {face.face_id}",
+        f"Yas {age_value}",
+        f"Aralik {age_label}",
         f"Takip {metrics['tracking_confidence'] * 100:0.0f}%",
         f"Goz {metrics['eye_open'] * 100:0.0f}%",
         f"Mutlu {metrics['happy'] * 100:0.0f}%",
@@ -210,7 +219,8 @@ def _draw_signal_strip(
             1,
             cv2.LINE_AA,
         )
-        x += 138
+        text_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.54, 1)[0][0]
+        x += text_width + 22
 
 
 def _draw_standby_card(frame) -> None:

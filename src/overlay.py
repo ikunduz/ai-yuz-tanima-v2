@@ -35,45 +35,48 @@ def draw_overlay(
 
 def _draw_expression_label(frame: np.ndarray, analysis: FaceAnalysis) -> None:
     x_min, y_min, x_max, _ = analysis.bbox
-    label = analysis.top_label
-    
+    label_parts = [analysis.top_label]
+    if analysis.age_label:
+        label_parts.append(analysis.age_label)
+    label = " | ".join(label_parts)
+
     # Text appearance
     font = cv2.FONT_HERSHEY_DUPLEX
     scale = 0.95
     thickness = 2
-    
+
     # Get text size for background box
     (w, h), baseline = cv2.getTextSize(label, font, scale, thickness)
-    
+
     # Position: Center above the face box
     label_x = x_min + (x_max - x_min) // 2 - w // 2
     label_y = y_min - 15
-    
+
     # Draw background box (Neon glow style)
     padding = 8
     box_x1 = label_x - padding
     box_y1 = label_y - h - padding
     box_x2 = label_x + w + padding
     box_y2 = label_y + padding
-    
+
     # Color mapping
     colors = {
         "Mutlu": (60, 220, 120),    # Emerald
         "Saskin": (80, 200, 255),   # Cloud Blue
         "Kizgin": (60, 60, 255),    # Vibrant Red
         "Uzgun": (255, 120, 60),    # Deep Orange/Blue
-        "Notr": (180, 180, 180)     # Muted Grey
+        "Notr": (180, 180, 180),    # Muted Grey
     }
-    color = colors.get(label, (180, 180, 180))
-    
+    color = colors.get(analysis.top_label, (180, 180, 180))
+
     # Semi-transparent dark background
     overlay = frame.copy()
     cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (15, 15, 15), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0.0, frame)
-    
+
     # Accent line
     cv2.line(frame, (box_x1, box_y2), (box_x2, box_y2), color, 2)
-    
+
     # Text
     cv2.putText(
         frame,

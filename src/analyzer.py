@@ -1,7 +1,8 @@
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import cast, Dict, List, Optional, Tuple, Any
 
+import cv2
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import vision
@@ -12,10 +13,14 @@ from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
 )
 
 try:
+    from .age_estimator import age_label_for_years, create_age_estimator, normalize_age_years
     from .config import AppConfig
+    from .emotion_estimator import create_emotion_estimator
     from .model_manager import ensure_face_landmarker_model
 except ImportError:
+    from age_estimator import age_label_for_years, create_age_estimator, normalize_age_years
     from config import AppConfig
+    from emotion_estimator import create_emotion_estimator
     from model_manager import ensure_face_landmarker_model
 
 
@@ -27,6 +32,8 @@ class FaceAnalysis:
     face_id: int
     selection_score: float
     top_label: str = "Notr"
+    age_years: Optional[float] = None
+    age_label: Optional[str] = None
 
 
 @dataclass
@@ -35,14 +42,23 @@ class TrackedFace:
     anchor: np.ndarray
     bbox: tuple[int, int, int, int]
     smoother: "MetricSmoother"
+    emotion_scores: Optional[Dict[str, float]] = None
+    last_emotion_inference_ms: int = 0
+    age_smoother: Optional["ScalarSmoother"] = None
+    age_years: Optional[float] = None
+    age_label: Optional[str] = None
+    age_history: Optional[List[float]] = None
+    age_stable_frames: int = 0
+    last_age_inference_ms: int = 0
     hits: int = 0
     misses: int = 0
     last_seen_ms: int = 0
 
 
 class MetricSmoother:
-    def __init__(self, alpha: float) -> None:
+    def __init__(self, alpha: float, emotion_backend: str = "rules") -> None:
         self.alpha = alpha
+        self.emotion_backend = emotion_backend
         self.state: Dict[str, float] = {}
 
     def update(self, metrics: Dict[str, float]) -> Dict[str, float]:
@@ -56,6 +72,8 @@ class MetricSmoother:
         return smoothed
 
     def _alpha_for_key(self, key: str) -> float:
+        if self.emotion_backend != "rules":
+            return self.alpha
         if key == "angry":
             return max(0.18, self.alpha * 0.55)
         if key == "sad":
@@ -63,9 +81,25 @@ class MetricSmoother:
         return self.alpha
 
 
+class ScalarSmoother:
+    def __init__(self, alpha: float) -> None:
+        self.alpha = alpha
+        self.state: Optional[float] = None
+
+    def update(self, value: float) -> float:
+        if self.state is None:
+            self.state = value
+        else:
+            state = cast(float, self.state)
+            self.state = (state * (1.0 - self.alpha)) + (value * self.alpha)
+        return cast(float, self.state)
+
+
 class FaceAnalyzer:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
+        self.age_estimator = create_age_estimator(self.config)
+        self.emotion_estimator = create_emotion_estimator(self.config)
         model_path = ensure_face_landmarker_model(self.config.model_path)
         options = vision.FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
@@ -115,16 +149,36 @@ class FaceAnalyzer:
             )
 
         analyses: List[FaceAnalysis] = []
-        matched_track_ids = set()
+        matched_track_ids: set[int] = set()
 
         for detection, track in self._match_tracks(detections, timestamp_ms):
-            bbox = detection["bbox"]
-            points = detection["points"]
-            center = detection["center"]
-            blendshape_scores = detection["blendshape_scores"]
+            bbox = cast(Tuple[int, int, int, int], detection["bbox"])
+            points = cast(np.ndarray, detection["points"])
+            center = cast(np.ndarray, detection["center"])
+            blendshape_scores = cast(Dict[str, float], detection["blendshape_scores"])
+
             metrics = self._calculate_metrics(points, bbox, blendshape_scores)
-            metrics["tracking_confidence"] = self._tracking_confidence(track, center, bbox)
+            metrics.update(
+                self._update_emotion_estimate(
+                    track=track,
+                    frame_rgb=frame_rgb,
+                    bbox=bbox,
+                    points=points,
+                    timestamp_ms=timestamp_ms,
+                )
+            )
+            tracking_confidence = self._tracking_confidence(track, center, bbox)
+            metrics["tracking_confidence"] = tracking_confidence
             metrics["presence"] = self._clamp((track.hits + 1) / 8.0)
+            age_motion = self._age_motion_delta(track, center, bbox)
+            age_yaw_ratio, age_roll_degrees = self._age_pose_metrics(points)
+            age_frame_is_stable = self._is_age_frame_stable(
+                track=track,
+                metrics=metrics,
+                motion_delta=age_motion,
+                yaw_ratio=age_yaw_ratio,
+                roll_degrees=age_roll_degrees,
+            )
 
             smoothed_metrics = track.smoother.update(metrics)
             track.anchor = center
@@ -132,25 +186,32 @@ class FaceAnalyzer:
             track.hits += 1
             track.misses = 0
             track.last_seen_ms = timestamp_ms
+            track.age_stable_frames = track.age_stable_frames + 1 if age_frame_is_stable else 0
             matched_track_ids.add(track.track_id)
+
+            age_years, age_label = self._update_age_estimate(
+                track=track,
+                frame_rgb=frame_rgb,
+                bbox=bbox,
+                points=points,
+                frame_is_stable=age_frame_is_stable,
+                timestamp_ms=timestamp_ms,
+            )
 
             # top_label calculation for UI (User requested 30% threshold)
             valid_expressions = {
+                "Notr": smoothed_metrics.get("neutral", 0.0),
                 "Mutlu": smoothed_metrics.get("happy", 0.0),
                 "Saskin": smoothed_metrics.get("surprised", 0.0),
                 "Kizgin": smoothed_metrics.get("angry", 0.0),
-                "Uzgun": smoothed_metrics.get("sad", 0.0)
+                "Uzgun": smoothed_metrics.get("sad", 0.0),
             }
-            top_name = "Notr"
-            best_score = 0.30
-            for name, score in valid_expressions.items():
-                if score > best_score:
-                    best_score = score
-                    top_label = name
-            
-            # Use top_label effectively
-            top_label = max(valid_expressions.items(), key=lambda x: x[1])
-            final_label = top_label[0] if top_label[1] >= 0.30 else "Notr"
+            top_label = max(valid_expressions.items(), key=lambda item: item[1])
+            final_label = (
+                top_label[0]
+                if top_label[0] == "Notr" or top_label[1] >= 0.30
+                else "Notr"
+            )
 
             analyses.append(
                 FaceAnalysis(
@@ -165,7 +226,9 @@ class FaceAnalyzer:
                         frame_height=frame_height,
                         metrics=smoothed_metrics,
                     ),
-                    top_label=final_label
+                    top_label=final_label,
+                    age_years=age_years,
+                    age_label=age_label,
                 )
             )
 
@@ -174,10 +237,267 @@ class FaceAnalyzer:
         return analyses
 
     @staticmethod
+    def _default_emotion_scores() -> Dict[str, float]:
+        return {
+            "happy": 0.0,
+            "surprised": 0.0,
+            "angry": 0.0,
+            "sad": 0.0,
+            "neutral": 1.0,
+        }
+
+    @staticmethod
     def select_primary_face(analyses: List[FaceAnalysis]) -> Optional[FaceAnalysis]:
         if not analyses:
             return None
         return analyses[0]
+
+    def _update_age_estimate(
+        self,
+        track: TrackedFace,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int],
+        points: np.ndarray,
+        frame_is_stable: bool,
+        timestamp_ms: int,
+    ) -> tuple[Optional[float], Optional[str]]:
+        if self.age_estimator is None or track.age_smoother is None:
+            return None, None
+
+        face_width = bbox[2] - bbox[0]
+        if face_width < self.config.age_min_face_width:
+            return track.age_years, track.age_label
+
+        if (
+            not frame_is_stable
+            or track.age_stable_frames < self.config.age_stability_required_frames
+        ):
+            return track.age_years, track.age_label
+
+        should_refresh = (
+            track.age_years is None
+            or timestamp_ms - track.last_age_inference_ms >= self.config.age_inference_interval_ms
+        )
+        if not should_refresh:
+            return track.age_years, track.age_label
+
+        aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
+        face_crop = self._extract_age_crop(
+            frame_rgb=frame_rgb,
+            bbox=bbox,
+            padding_ratio=self.config.age_crop_padding_ratio,
+            top_bias_ratio=self.config.age_crop_top_bias_ratio,
+        )
+        body_crop = self._extract_body_crop(frame_rgb, bbox)
+        if face_crop is None and aligned_crop is None:
+            return track.age_years, track.age_label
+
+        prediction = self.age_estimator.predict_from_crops(
+            face_rgb=face_crop,
+            body_rgb=body_crop,
+            aligned_face_rgb=aligned_crop,
+        )
+        if prediction is None:
+            return track.age_years, track.age_label
+
+        calibrated_age = self._calibrate_age_prediction(
+            age_years=prediction.age_years,
+            aligned_crop=aligned_crop,
+        )
+        robust_age = self._update_age_history(track, calibrated_age)
+        
+        if track.age_smoother is None:
+            track.age_smoother = ScalarSmoother(self.config.age_smoothing_alpha)
+        
+        age_smoother = cast(ScalarSmoother, track.age_smoother)
+        smoothed_age = age_smoother.update(robust_age)
+        track.age_years = smoothed_age
+        track.age_label = age_label_for_years(smoothed_age)
+        track.last_age_inference_ms = timestamp_ms
+        return track.age_years, track.age_label
+
+    def _update_emotion_estimate(
+        self,
+        track: TrackedFace,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int],
+        points: np.ndarray,
+        timestamp_ms: int,
+    ) -> Dict[str, float]:
+        if self.emotion_estimator is None:
+            neutral_score = self._clamp(
+                1.0
+                - max(
+                    track.smoother.state.get("happy", 0.0),
+                    track.smoother.state.get("surprised", 0.0),
+                    track.smoother.state.get("angry", 0.0),
+                    track.smoother.state.get("sad", 0.0),
+                )
+            )
+            return {"neutral": neutral_score}
+
+        cached_scores = dict(track.emotion_scores or self._default_emotion_scores())
+        face_width = bbox[2] - bbox[0]
+        if face_width < self.config.emotion_min_face_width:
+            return cached_scores
+
+        should_refresh = (
+            track.last_emotion_inference_ms == 0
+            or timestamp_ms - track.last_emotion_inference_ms
+            >= self.config.emotion_inference_interval_ms
+        )
+        if not should_refresh:
+            return cached_scores
+
+        aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
+        face_crop = self._extract_age_crop(
+            frame_rgb=frame_rgb,
+            bbox=bbox,
+            padding_ratio=self.config.emotion_crop_padding_ratio,
+            top_bias_ratio=self.config.emotion_crop_top_bias_ratio,
+        )
+        input_crop = aligned_crop if aligned_crop is not None else face_crop
+        if input_crop is None or input_crop.size == 0:
+            return cached_scores
+
+        prediction = self.emotion_estimator.predict(input_crop)
+        if prediction is None:
+            return cached_scores
+
+        merged_scores = self._default_emotion_scores()
+        for key, value in prediction.scores.items():
+            merged_scores[key] = self._clamp(float(value))
+        if "neutral" not in prediction.scores:
+            merged_scores["neutral"] = self._clamp(
+                1.0
+                - max(
+                    merged_scores["happy"],
+                    merged_scores["surprised"],
+                    merged_scores["angry"],
+                    merged_scores["sad"],
+                )
+            )
+
+        track.last_emotion_inference_ms = timestamp_ms
+        track.emotion_scores = merged_scores
+        return merged_scores
+
+    def _calibrate_age_prediction(
+        self,
+        age_years: float,
+        aligned_crop: Optional[np.ndarray],
+    ) -> float:
+        if getattr(self.age_estimator, "backend_name", "") != "openvino":
+            return normalize_age_years(age_years)
+        calibrated = age_years + self.config.age_bias_years
+        calibrated += self._gray_hair_bonus(aligned_crop)
+        return normalize_age_years(calibrated)
+
+    def _gray_hair_bonus(self, aligned_crop: Optional[np.ndarray]) -> float:
+        if aligned_crop is None or aligned_crop.size == 0:
+            return 0.0
+
+        crop = cast(np.ndarray, aligned_crop)
+        height, width = crop.shape[:2]
+        x_min = int(width * 0.24)
+        x_max = int(width * 0.76)
+        y_min = 0
+        y_max = max(int(height * 0.18), 1)
+        top_region = crop[y_min:y_max, x_min:x_max]
+        if top_region.size == 0:
+            return 0.0
+
+        hsv = cv2.cvtColor(top_region, cv2.COLOR_RGB2HSV)
+        saturation = hsv[:, :, 1].astype(np.float32)
+        value = hsv[:, :, 2].astype(np.float32)
+
+        silver_mask = (
+            (saturation < 38.0)
+            & (value > 55.0)
+            & (value < 220.0)
+        )
+        silver_ratio = float(np.mean(silver_mask))
+        if silver_ratio <= 0.16:
+            return 0.0
+
+        normalized = self._clamp((silver_ratio - 0.16) / 0.36)
+        return normalized * self.config.gray_hair_bonus_max_years
+
+    def _update_age_history(self, track: TrackedFace, age_years: float) -> float:
+        if track.age_history is None:
+            track.age_history = []
+
+        age_history = cast(List[float], track.age_history)
+        age_history.append(age_years)
+        max_size = max(int(self.config.age_history_size), 1)
+        if len(age_history) > max_size:
+            # Using list comprehension to avoid slice indexing issues in some strict analyzers
+            start_idx = len(age_history) - max_size
+            age_history = [age_history[i] for i in range(start_idx, len(age_history))]
+        track.age_history = age_history
+
+        ordered = cast(List[float], sorted(age_history))
+        trim = min(int(self.config.age_history_trim), max(0, (len(ordered) - 1) // 2))
+        if trim > 0:
+            # Using list comprehension to avoid slice indexing issues
+            ordered = [ordered[i] for i in range(trim, len(ordered) - trim)]
+        if not ordered:
+            return age_years
+        return float(np.mean(np.asarray(ordered, dtype=np.float32)))
+
+    def _age_motion_delta(
+        self,
+        track: TrackedFace,
+        center: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> float:
+        if track.hits == 0:
+            return 1.0
+
+        scale = max(float(bbox[2] - bbox[0]), float(track.bbox[2] - track.bbox[0]), 1.0)
+        return float(np.linalg.norm(center - track.anchor) / scale)
+
+    @staticmethod
+    def _age_pose_metrics(points: np.ndarray) -> tuple[float, float]:
+        left_eye = np.mean(points[[33, 133, 159, 145]], axis=0)
+        right_eye = np.mean(points[[362, 263, 386, 374]], axis=0)
+        nose_tip = points[1]
+
+        left_span = float(np.linalg.norm(nose_tip - left_eye))
+        right_span = float(np.linalg.norm(nose_tip - right_eye))
+        yaw_ratio = abs(left_span - right_span) / max(left_span + right_span, 1e-6)
+
+        eye_vector = right_eye - left_eye
+        roll_degrees = abs(float(np.degrees(np.arctan2(eye_vector[1], eye_vector[0]))))
+        return yaw_ratio, roll_degrees
+
+    def _is_age_frame_stable(
+        self,
+        track: TrackedFace,
+        metrics: Dict[str, float],
+        motion_delta: float,
+        yaw_ratio: float,
+        roll_degrees: float,
+    ) -> bool:
+        if track.hits < 2:
+            return False
+
+        strongest_expression = max(
+            metrics.get("happy", 0.0),
+            metrics.get("surprised", 0.0),
+            metrics.get("angry", 0.0),
+            metrics.get("sad", 0.0),
+        )
+        return bool(
+            metrics.get("tracking_confidence", 0.0)
+            >= self.config.age_stability_min_tracking_confidence
+            and metrics.get("presence", 0.0) >= self.config.age_stability_min_presence
+            and strongest_expression <= self.config.age_stability_max_expression
+            and metrics.get("mouth_open", 1.0) <= self.config.age_stability_max_mouth_open
+            and motion_delta <= self.config.age_stability_max_motion
+            and yaw_ratio <= self.config.age_stability_max_yaw_ratio
+            and roll_degrees <= self.config.age_stability_max_roll_degrees
+        )
 
     def _match_tracks(
         self,
@@ -214,15 +534,117 @@ class FaceAnalyzer:
                 track = self.tracks[matched_track_id]
                 available_track_ids.remove(matched_track_id)
             else:
+                det_bbox = cast(Tuple[int, int, int, int], detection["bbox"])
                 track = self._create_track(
                     anchor=center,
-                    bbox=detection["bbox"],
+                    bbox=det_bbox,
                     timestamp_ms=timestamp_ms,
                 )
 
             assignments.append((detection, track))
 
         return assignments
+
+    def _extract_aligned_age_crop(
+        self,
+        frame_rgb: np.ndarray,
+        points: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        output_size = int(self.config.age_aligned_crop_size)
+        if output_size < 64:
+            output_size = 64
+
+        left_eye = np.mean(points[[33, 133, 159, 145]], axis=0).astype(np.float32)
+        right_eye = np.mean(points[[362, 263, 386, 374]], axis=0).astype(np.float32)
+        mouth_center = np.mean(points[[61, 291, 13, 14]], axis=0).astype(np.float32)
+
+        source = np.array([left_eye, right_eye, mouth_center], dtype=np.float32)
+        if cv2.contourArea(source.reshape(-1, 1, 2)) < 1.0:
+            return None
+
+        destination = np.array(
+            [
+                [output_size * 0.32, output_size * 0.37],
+                [output_size * 0.68, output_size * 0.37],
+                [output_size * 0.50, output_size * 0.72],
+            ],
+            dtype=np.float32,
+        )
+        matrix = cv2.getAffineTransform(source, destination)
+        return cv2.warpAffine(
+            frame_rgb,
+            matrix,
+            (output_size, output_size),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+
+    def _extract_age_crop(
+        self,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int],
+        padding_ratio: float,
+        top_bias_ratio: float,
+    ) -> Optional[np.ndarray]:
+        frame_height, frame_width = frame_rgb.shape[:2]
+        x_min, y_min, x_max, y_max = bbox
+
+        width = max(float(x_max - x_min), 1.0)
+        height = max(float(y_max - y_min), 1.0)
+
+        crop_size = max(width * (1.0 + padding_ratio * 2.0), height * (1.0 + padding_ratio * 2.4))
+        center_x = (x_min + x_max) / 2.0
+        center_y = ((y_min + y_max) / 2.0) - (height * top_bias_ratio)
+        half = crop_size / 2.0
+
+        crop_x_min = int(np.clip(np.floor(center_x - half), 0, frame_width - 1))
+        crop_y_min = int(np.clip(np.floor(center_y - half), 0, frame_height - 1))
+        crop_x_max = int(np.clip(np.ceil(center_x + half), crop_x_min + 1, frame_width))
+        crop_y_max = int(np.clip(np.ceil(center_y + half), crop_y_min + 1, frame_height))
+
+        if crop_x_max <= crop_x_min or crop_y_max <= crop_y_min:
+            return None
+
+        return frame_rgb[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
+
+    def _extract_body_crop(
+        self,
+        frame_rgb: np.ndarray,
+        bbox: tuple[int, int, int, int],
+    ) -> Optional[np.ndarray]:
+        frame_height, frame_width = frame_rgb.shape[:2]
+        x_min, y_min, x_max, y_max = bbox
+
+        face_width = max(float(x_max - x_min), 1.0)
+        face_height = max(float(y_max - y_min), 1.0)
+        center_x = (x_min + x_max) / 2.0
+
+        crop_width = face_width * self.config.age_body_width_scale
+        crop_height = face_height * (
+            self.config.age_body_above_face_scale + self.config.age_body_below_face_scale
+        )
+
+        crop_x_min = int(np.clip(np.floor(center_x - crop_width / 2.0), 0, frame_width - 1))
+        crop_x_max = int(np.clip(np.ceil(center_x + crop_width / 2.0), crop_x_min + 1, frame_width))
+        crop_y_min = int(
+            np.clip(
+                np.floor(y_min - face_height * self.config.age_body_above_face_scale),
+                0,
+                frame_height - 1,
+            )
+        )
+        crop_y_max = int(
+            np.clip(
+                np.ceil(y_max + face_height * self.config.age_body_below_face_scale),
+                crop_y_min + 1,
+                frame_height,
+            )
+        )
+
+        if crop_x_max <= crop_x_min or crop_y_max <= crop_y_min:
+            return None
+
+        return frame_rgb[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
 
     def _create_track(
         self,
@@ -234,7 +656,17 @@ class FaceAnalyzer:
             track_id=self.next_track_id,
             anchor=np.array(anchor, dtype=np.float32),
             bbox=bbox,
-            smoother=MetricSmoother(self.config.smoothing_alpha),
+            smoother=MetricSmoother(
+                self.config.smoothing_alpha,
+                emotion_backend=self.config.emotion_backend.lower(),
+            ),
+            emotion_scores=self._default_emotion_scores(),
+            age_smoother=(
+                ScalarSmoother(self.config.age_smoothing_alpha)
+                if self.age_estimator is not None
+                else None
+            ),
+            age_history=[],
             last_seen_ms=timestamp_ms,
         )
         self.tracks[track.track_id] = track
@@ -821,10 +1253,14 @@ class FaceAnalyzer:
         return {
             "tracking_confidence": 0.0,
             "eye_open": eye_open,
+            "mouth_open": mouth_open,
             "happy": happy_score,
             "surprised": surprised_score,
             "angry": angry_score,
             "sad": sad_score,
+            "neutral": self._clamp(
+                1.0 - max(happy_score, surprised_score, angry_score, sad_score)
+            ),
             "presence": 0.0,
         }
 
@@ -853,4 +1289,8 @@ class FaceAnalyzer:
         return float(max(minimum, min(maximum, value)))
 
     def close(self) -> None:
+        if self.emotion_estimator is not None:
+            self.emotion_estimator.close()
+        if self.age_estimator is not None:
+            self.age_estimator.close()
         self.landmarker.close()

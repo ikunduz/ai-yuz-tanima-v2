@@ -1,3 +1,11 @@
 mediapipe==0.10.33
 opencv-contrib-python==4.11.0.86
 numpy==1.26.4
+openvino==2025.3.0
+torch==2.8.0
+timm==0.8.13.dev0
+transformers==4.51.0
+accelerate==1.10.1
+huggingface_hub==0.36.2
+safetensors==0.7.0
+emotiefflib==1.1.1
