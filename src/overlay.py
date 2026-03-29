@@ -74,9 +74,9 @@ def _draw_focus_aura(frame: np.ndarray, analysis: FaceAnalysis) -> None:
 def _draw_expression_label(frame: np.ndarray, analysis: FaceAnalysis) -> None:
     x_min, y_min, x_max, _ = analysis.bbox
     color = _label_color(analysis.top_label)
-    title = analysis.top_label.upper()
+    title = analysis.top_label
     subtitle = f"~{analysis.age_years:0.0f} YAŞ" if analysis.age_years is not None else (
-        (analysis.age_label or "YAŞ TAHMİNİ").upper()
+        analysis.age_label or "Yaş tahmini"
     )
 
     title_font = cv2.FONT_HERSHEY_DUPLEX

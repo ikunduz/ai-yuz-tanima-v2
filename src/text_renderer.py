@@ -28,10 +28,29 @@ def _font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(_font_path(), max(int(size), 8))
 
 
+@lru_cache(maxsize=512)
 def measure_text(text: str, font_size: int) -> Tuple[int, int]:
     font = _font(font_size)
     left, top, right, bottom = font.getbbox(text)
     return max(int(right - left), 1), max(int(bottom - top), 1)
+
+
+@lru_cache(maxsize=512)
+def _render_text_rgba(
+    text: str,
+    font_size: int,
+    color_bgr: Tuple[int, int, int],
+) -> np.ndarray:
+    font = _font(font_size)
+    left, top, right, bottom = font.getbbox(text)
+    text_w = max(int(right - left), 1)
+    text_h = max(int(bottom - top), 1)
+    pad = 2
+    overlay = Image.new("RGBA", (text_w + pad * 2, text_h + pad * 2), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    color_rgb = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]), 255)
+    draw.text((pad - left, pad - top), text, font=font, fill=color_rgb)
+    return np.asarray(overlay, dtype=np.uint8)
 
 
 def draw_text(
@@ -42,10 +61,7 @@ def draw_text(
     color_bgr: Tuple[int, int, int],
     anchor: Anchor = "lt",
 ) -> None:
-    font = _font(font_size)
-    left, top, right, bottom = font.getbbox(text)
-    text_w = max(int(right - left), 1)
-    text_h = max(int(bottom - top), 1)
+    text_w, text_h = measure_text(text, font_size)
 
     x, y = int(position[0]), int(position[1])
     if anchor == "mm":
@@ -59,13 +75,7 @@ def draw_text(
     if x >= frame.shape[1] or y >= frame.shape[0]:
         return
 
-    pad = 2
-    overlay = Image.new("RGBA", (text_w + pad * 2, text_h + pad * 2), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    color_rgb = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]), 255)
-    draw.text((pad - left, pad - top), text, font=font, fill=color_rgb)
-
-    overlay_np = np.asarray(overlay, dtype=np.uint8)
+    overlay_np = _render_text_rgba(text, font_size, color_bgr)
     h, w = overlay_np.shape[:2]
     roi_x2 = min(x + w, frame.shape[1])
     roi_y2 = min(y + h, frame.shape[0])

@@ -1,7 +1,8 @@
 import math
 import platform
+import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 import cv2
 
@@ -24,10 +25,93 @@ HOLD_AFTER_LOSS_SECONDS = 1.1
 FPS_SMOOTHING_ALPHA = 0.2
 
 
+def _turkish_upper(text: str) -> str:
+    translation = str.maketrans({
+        "i": "İ",
+        "ı": "I",
+        "ş": "Ş",
+        "ğ": "Ğ",
+        "ü": "Ü",
+        "ö": "Ö",
+        "ç": "Ç",
+    })
+    return text.translate(translation).upper()
+
+
+class AsyncAnalysisRunner:
+    def __init__(self, analyzer: FaceAnalyzer) -> None:
+        self._analyzer = analyzer
+        self._lock = threading.Lock()
+        self._frame_ready = threading.Event()
+        self._stop_requested = threading.Event()
+        self._worker_error: Optional[BaseException] = None
+        self._pending_frame: Optional[cv2.typing.MatLike] = None
+        self._latest_analyses: List[FaceAnalysis] = []
+        self._thread = threading.Thread(
+            target=self._run,
+            name="async-face-analyzer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, frame_rgb: cv2.typing.MatLike) -> None:
+        if self._stop_requested.is_set():
+            return
+        with self._lock:
+            self._pending_frame = frame_rgb
+        self._frame_ready.set()
+
+    def latest_analyses(self) -> List[FaceAnalysis]:
+        self._raise_if_failed()
+        with self._lock:
+            return list(self._latest_analyses)
+
+    def close(self) -> None:
+        self._stop_requested.set()
+        self._frame_ready.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._raise_if_failed()
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_requested.is_set():
+                self._frame_ready.wait(timeout=0.1)
+                if self._stop_requested.is_set():
+                    break
+
+                while not self._stop_requested.is_set():
+                    with self._lock:
+                        frame_rgb = self._pending_frame
+                        self._pending_frame = None
+                        if frame_rgb is None:
+                            self._frame_ready.clear()
+                            break
+
+                    analyses = self._analyzer.analyze(frame_rgb)
+
+                    with self._lock:
+                        self._latest_analyses = analyses
+                        has_pending_frame = self._pending_frame is not None
+                        if not has_pending_frame:
+                            self._frame_ready.clear()
+                    if not has_pending_frame:
+                        break
+        except BaseException as exc:
+            self._worker_error = exc
+            self._stop_requested.set()
+            self._frame_ready.set()
+
+    def _raise_if_failed(self) -> None:
+        if self._worker_error is not None:
+            raise RuntimeError("Background analysis worker failed.") from self._worker_error
+
+
 def main() -> None:
     config = DEFAULT_CONFIG
     camera = CameraSource(config)
     analyzer: Optional[FaceAnalyzer] = None
+    analysis_runner: Optional[AsyncAnalysisRunner] = None
 
     last_frame_ts = time.monotonic()
     display_fps = 0.0
@@ -44,6 +128,7 @@ def main() -> None:
     try:
         _open_camera_or_raise(camera)
         analyzer = FaceAnalyzer(config)
+        analysis_runner = AsyncAnalysisRunner(analyzer)
 
         while True:
             frame = camera.read()
@@ -53,11 +138,12 @@ def main() -> None:
             if config.mirror_preview:
                 frame = cv2.flip(frame, 1)
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            analyses = analyzer.analyze(rgb_frame)
-            primary_face = analyzer.select_primary_face(analyses)
-
             now = time.monotonic()
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            analysis_runner.submit(rgb_frame)
+            analyses = analysis_runner.latest_analyses()
+            primary_face = FaceAnalyzer.select_primary_face(analyses)
+
             raw_fps = 1.0 / max(now - last_frame_ts, 1e-6)
             last_frame_ts = now
             if display_fps == 0.0:
@@ -136,6 +222,8 @@ def main() -> None:
             if key == ord("l"):
                 draw_landmarks = not draw_landmarks
     finally:
+        if analysis_runner is not None:
+            analysis_runner.close()
         if analyzer is not None:
             analyzer.close()
         camera.release()
@@ -266,7 +354,7 @@ def _draw_emotion_meter(
     cv2.rectangle(frame, (x, y), (x + w, y + h), (18, 22, 28), -1)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
 
-    draw_text(frame, label.upper(), (x + 12, y + 8), 19, (245, 245, 245))
+    draw_text(frame, _turkish_upper(label), (x + 12, y + 8), 19, (245, 245, 245))
     cv2.putText(
         frame,
         f"{value * 100:0.0f}%",
