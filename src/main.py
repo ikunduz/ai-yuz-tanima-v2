@@ -111,7 +111,11 @@ def main() -> None:
     config = DEFAULT_CONFIG
     camera = CameraSource(config)
     analyzer: Optional[FaceAnalyzer] = None
-    analysis_runner: Optional[AsyncAnalysisRunner] = None
+    target_frame_time = (
+        1.0 / config.target_render_fps
+        if config.target_render_fps > 0
+        else 0.0
+    )
 
     last_frame_ts = time.monotonic()
     display_fps = 0.0
@@ -128,9 +132,9 @@ def main() -> None:
     try:
         _open_camera_or_raise(camera)
         analyzer = FaceAnalyzer(config)
-        analysis_runner = AsyncAnalysisRunner(analyzer)
 
         while True:
+            loop_started_at = time.monotonic()
             frame = camera.read()
             if frame is None:
                 raise RuntimeError("Camera returned an empty frame.")
@@ -140,9 +144,8 @@ def main() -> None:
 
             now = time.monotonic()
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            analysis_runner.submit(rgb_frame)
-            analyses = analysis_runner.latest_analyses()
-            primary_face = FaceAnalyzer.select_primary_face(analyses)
+            analyses = analyzer.analyze(rgb_frame)
+            primary_face = analyzer.select_primary_face(analyses)
 
             raw_fps = 1.0 / max(now - last_frame_ts, 1e-6)
             last_frame_ts = now
@@ -205,6 +208,10 @@ def main() -> None:
             )
 
             cv2.imshow(config.window_name, output)
+            if target_frame_time > 0.0:
+                remaining = target_frame_time - (time.monotonic() - loop_started_at)
+                if remaining > 0.0:
+                    time.sleep(remaining)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (27, ord("q")):
@@ -222,8 +229,6 @@ def main() -> None:
             if key == ord("l"):
                 draw_landmarks = not draw_landmarks
     finally:
-        if analysis_runner is not None:
-            analysis_runner.close()
         if analyzer is not None:
             analyzer.close()
         camera.release()

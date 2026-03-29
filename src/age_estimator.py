@@ -48,6 +48,14 @@ class AgePrediction:
 
 def age_label_for_years(age_years: float) -> str:
     rounded = normalize_age_years(age_years)
+    if rounded < 6.0:
+        return "0-5"
+    if rounded < 10.0:
+        return "6-9"
+    if rounded < 13.0:
+        return "10-12"
+    if rounded < 18.0:
+        return "13-17"
     if rounded < 25.0:
         return "18-24"
     if rounded < 30.0:
@@ -68,11 +76,17 @@ def age_label_for_years(age_years: float) -> str:
         return "60-64"
     if rounded < 70.0:
         return "65-69"
-    return "70-75"
+    if rounded < 80.0:
+        return "70-79"
+    return "80+"
 
 
-def normalize_age_years(age_years: float) -> float:
-    return float(np.clip(age_years, 18.0, 75.0))
+def normalize_age_years(
+    age_years: float,
+    min_age: float = 0.0,
+    max_age: float = 100.0,
+) -> float:
+    return float(np.clip(age_years, min_age, max_age))
 
 
 def _letterbox_rgb(image_rgb: np.ndarray, target_size: int) -> np.ndarray:
@@ -163,7 +177,7 @@ class OpenVinoAgeEstimator(BaseAgeEstimator):
         outputs = self.compiled_model([tensor])
 
         raw_age = float(np.asarray(outputs[self.age_output]).reshape(-1)[0] * 100.0)
-        age_years = normalize_age_years(raw_age)
+        age_years = normalize_age_years(raw_age, min_age=18.0, max_age=75.0)
 
         gender_scores = np.asarray(outputs[self.gender_output]).reshape(-1)
         gender_index = int(np.argmax(gender_scores)) if gender_scores.size else 0
@@ -313,7 +327,11 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
         with torch.inference_mode():
             output = self.model(faces_input=faces_input, body_input=body_input)
 
-        age_years = normalize_age_years(float(output.age_output[0].detach().float().cpu().item()))
+        age_years = normalize_age_years(
+            float(output.age_output[0].detach().float().cpu().item()),
+            min_age=0.0,
+            max_age=100.0,
+        )
         gender_label = None
         gender_confidence = None
         if output.gender_class_idx is not None and output.gender_probs is not None:

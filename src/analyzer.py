@@ -1,3 +1,4 @@
+from concurrent.futures import Future, ThreadPoolExecutor
 import time
 from dataclasses import dataclass
 from typing import cast, Dict, List, Optional, Tuple, Any
@@ -49,12 +50,14 @@ class TrackedFace:
     label_candidate: str = "Sakin"
     label_candidate_frames: int = 0
     last_emotion_inference_ms: int = 0
+    pending_emotion_future: Optional[Future] = None
     age_smoother: Optional["ScalarSmoother"] = None
     age_years: Optional[float] = None
     age_label: Optional[str] = None
     age_history: Optional[List[float]] = None
     age_stable_frames: int = 0
     last_age_inference_ms: int = 0
+    pending_age_future: Optional[Future] = None
     hits: int = 0
     misses: int = 0
     last_seen_ms: int = 0
@@ -115,6 +118,7 @@ class FaceAnalyzer:
             output_face_blendshapes=True,
         )
         self.landmarker = vision.FaceLandmarker.create_from_options(options)
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="face-models")
         self.last_timestamp_ms = 0
         self.tracks: Dict[int, TrackedFace] = {}
         self.next_track_id = 1
@@ -272,6 +276,8 @@ class FaceAnalyzer:
         if self.age_estimator is None or track.age_smoother is None:
             return None, None
 
+        self._consume_age_future(track)
+
         face_width = bbox[2] - bbox[0]
         if face_width < self.config.age_min_face_width:
             return track.age_years, track.age_label
@@ -286,7 +292,7 @@ class FaceAnalyzer:
             track.age_years is None
             or timestamp_ms - track.last_age_inference_ms >= self.config.age_inference_interval_ms
         )
-        if not should_refresh:
+        if not should_refresh or track.pending_age_future is not None:
             return track.age_years, track.age_label
 
         aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
@@ -300,28 +306,13 @@ class FaceAnalyzer:
         if face_crop is None and aligned_crop is None:
             return track.age_years, track.age_label
 
-        prediction = self.age_estimator.predict_from_crops(
-            face_rgb=face_crop,
-            body_rgb=body_crop,
-            aligned_face_rgb=aligned_crop,
+        track.pending_age_future = self.executor.submit(
+            self._run_age_inference,
+            face_crop,
+            body_crop,
+            aligned_crop,
+            timestamp_ms,
         )
-        if prediction is None:
-            return track.age_years, track.age_label
-
-        calibrated_age = self._calibrate_age_prediction(
-            age_years=prediction.age_years,
-            aligned_crop=aligned_crop,
-        )
-        robust_age = self._update_age_history(track, calibrated_age)
-        
-        if track.age_smoother is None:
-            track.age_smoother = ScalarSmoother(self.config.age_smoothing_alpha)
-        
-        age_smoother = cast(ScalarSmoother, track.age_smoother)
-        smoothed_age = age_smoother.update(robust_age)
-        track.age_years = smoothed_age
-        track.age_label = age_label_for_years(smoothed_age)
-        track.last_age_inference_ms = timestamp_ms
         return track.age_years, track.age_label
 
     def _update_emotion_estimate(
@@ -338,6 +329,7 @@ class FaceAnalyzer:
         if self.emotion_estimator is None:
             return {"neutral": rule_scores["neutral"]}
 
+        self._consume_emotion_future(track)
         cached_scores = dict(track.emotion_scores or rule_scores)
         face_width = bbox[2] - bbox[0]
         if face_width < self.config.emotion_min_face_width:
@@ -364,7 +356,7 @@ class FaceAnalyzer:
             or timestamp_ms - track.last_emotion_inference_ms
             >= self.config.emotion_inference_interval_ms
         )
-        if should_refresh:
+        if should_refresh and track.pending_emotion_future is None:
             aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
             face_crop = self._extract_age_crop(
                 frame_rgb=frame_rgb,
@@ -378,24 +370,17 @@ class FaceAnalyzer:
                 padding_ratio=self.config.emotion_context_padding_ratio,
                 top_bias_ratio=self.config.emotion_context_top_bias_ratio,
             )
-
-            prediction = self.emotion_estimator.predict(
-                face_rgb=face_crop,
-                aligned_face_rgb=aligned_crop,
-                context_rgb=context_crop,
+            track.pending_emotion_future = self.executor.submit(
+                self._run_emotion_inference,
+                face_crop,
+                aligned_crop,
+                context_crop,
+                rule_scores,
+                base_metrics.get("mouth_open", 0.0),
+                base_metrics.get("eye_open", 0.0),
+                frame_quality,
+                timestamp_ms,
             )
-            if prediction is not None:
-                cached_scores = self._calibrate_emotion_prediction(
-                    model_scores=prediction.scores,
-                    rule_scores=rule_scores,
-                    mouth_open=base_metrics.get("mouth_open", 0.0),
-                    eye_open=base_metrics.get("eye_open", 0.0),
-                    frame_quality=frame_quality,
-                )
-                track.emotion_scores = cached_scores
-                track.emotion_confidence = prediction.confidence
-                track.emotion_margin = prediction.margin
-                track.last_emotion_inference_ms = timestamp_ms
 
         return self._blend_emotion_sources(
             rule_scores=rule_scores,
@@ -406,6 +391,98 @@ class FaceAnalyzer:
             mouth_open=base_metrics.get("mouth_open", 0.0),
             eye_open=base_metrics.get("eye_open", 0.0),
         )
+
+    def _consume_age_future(self, track: TrackedFace) -> None:
+        future = track.pending_age_future
+        if future is None or not future.done():
+            return
+        track.pending_age_future = None
+        try:
+            result = future.result()
+        except Exception:
+            return
+        if result is None or track.age_smoother is None:
+            return
+
+        calibrated_age, timestamp_ms = cast(Tuple[float, int], result)
+        robust_age = self._update_age_history(track, calibrated_age)
+        age_smoother = cast(ScalarSmoother, track.age_smoother)
+        smoothed_age = age_smoother.update(robust_age)
+        track.age_years = smoothed_age
+        track.age_label = age_label_for_years(smoothed_age)
+        track.last_age_inference_ms = timestamp_ms
+
+    def _consume_emotion_future(self, track: TrackedFace) -> None:
+        future = track.pending_emotion_future
+        if future is None or not future.done():
+            return
+        track.pending_emotion_future = None
+        try:
+            result = future.result()
+        except Exception:
+            return
+        if result is None:
+            return
+
+        scores, confidence, margin, timestamp_ms = cast(
+            Tuple[Dict[str, float], float, float, int],
+            result,
+        )
+        track.emotion_scores = scores
+        track.emotion_confidence = confidence
+        track.emotion_margin = margin
+        track.last_emotion_inference_ms = timestamp_ms
+
+    def _run_age_inference(
+        self,
+        face_crop: Optional[np.ndarray],
+        body_crop: Optional[np.ndarray],
+        aligned_crop: Optional[np.ndarray],
+        timestamp_ms: int,
+    ) -> Optional[Tuple[float, int]]:
+        if self.age_estimator is None:
+            return None
+        prediction = self.age_estimator.predict_from_crops(
+            face_rgb=face_crop,
+            body_rgb=body_crop,
+            aligned_face_rgb=aligned_crop,
+        )
+        if prediction is None:
+            return None
+        calibrated_age = self._calibrate_age_prediction(
+            age_years=prediction.age_years,
+            aligned_crop=aligned_crop,
+        )
+        return calibrated_age, timestamp_ms
+
+    def _run_emotion_inference(
+        self,
+        face_crop: Optional[np.ndarray],
+        aligned_crop: Optional[np.ndarray],
+        context_crop: Optional[np.ndarray],
+        rule_scores: Dict[str, float],
+        mouth_open: float,
+        eye_open: float,
+        frame_quality: float,
+        timestamp_ms: int,
+    ) -> Optional[Tuple[Dict[str, float], float, float, int]]:
+        if self.emotion_estimator is None:
+            return None
+        prediction = self.emotion_estimator.predict(
+            face_rgb=face_crop,
+            aligned_face_rgb=aligned_crop,
+            context_rgb=context_crop,
+        )
+        if prediction is None:
+            return None
+        scores = self._calibrate_emotion_prediction(
+            model_scores=prediction.scores,
+            rule_scores=rule_scores,
+            mouth_open=mouth_open,
+            eye_open=eye_open,
+            frame_quality=frame_quality,
+        )
+        return scores, prediction.confidence, prediction.margin, timestamp_ms
 
     def _emotion_frame_quality(
         self,
@@ -627,10 +704,10 @@ class FaceAnalyzer:
         aligned_crop: Optional[np.ndarray],
     ) -> float:
         if getattr(self.age_estimator, "backend_name", "") != "openvino":
-            return normalize_age_years(age_years)
+            return normalize_age_years(age_years, min_age=0.0, max_age=100.0)
         calibrated = age_years + self.config.age_bias_years
         calibrated += self._gray_hair_bonus(aligned_crop)
-        return normalize_age_years(calibrated)
+        return normalize_age_years(calibrated, min_age=18.0, max_age=75.0)
 
     def _gray_hair_bonus(self, aligned_crop: Optional[np.ndarray]) -> float:
         if aligned_crop is None or aligned_crop.size == 0:
@@ -921,7 +998,13 @@ class FaceAnalyzer:
                 stale_track_ids.append(track_id)
 
         for track_id in stale_track_ids:
-            self.tracks.pop(track_id, None)
+            track = self.tracks.pop(track_id, None)
+            if track is None:
+                continue
+            if track.pending_age_future is not None:
+                track.pending_age_future.cancel()
+            if track.pending_emotion_future is not None:
+                track.pending_emotion_future.cancel()
 
     @staticmethod
     def _bbox_from_points(
@@ -1528,6 +1611,7 @@ class FaceAnalyzer:
         return float(max(minimum, min(maximum, value)))
 
     def close(self) -> None:
+        self.executor.shutdown(wait=False, cancel_futures=True)
         if self.emotion_estimator is not None:
             self.emotion_estimator.close()
         if self.age_estimator is not None:
