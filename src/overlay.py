@@ -65,7 +65,7 @@ def _draw_expression_label(frame: np.ndarray, analysis: FaceAnalysis) -> None:
         "Saskin": (80, 200, 255),   # Cloud Blue
         "Kizgin": (60, 60, 255),    # Vibrant Red
         "Uzgun": (255, 120, 60),    # Deep Orange/Blue
-        "Notr": (180, 180, 180),    # Muted Grey
+        "Sakin": (180, 180, 180),   # Muted Grey
     }
     color = colors.get(analysis.top_label, (180, 180, 180))
 

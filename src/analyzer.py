@@ -31,7 +31,7 @@ class FaceAnalysis:
     points: np.ndarray
     face_id: int
     selection_score: float
-    top_label: str = "Notr"
+    top_label: str = "Sakin"
     age_years: Optional[float] = None
     age_label: Optional[str] = None
 
@@ -45,8 +45,8 @@ class TrackedFace:
     emotion_scores: Optional[Dict[str, float]] = None
     emotion_confidence: float = 0.0
     emotion_margin: float = 0.0
-    top_label_state: str = "Notr"
-    label_candidate: str = "Notr"
+    top_label_state: str = "Sakin"
+    label_candidate: str = "Sakin"
     label_candidate_frames: int = 0
     last_emotion_inference_ms: int = 0
     age_smoother: Optional["ScalarSmoother"] = None
@@ -571,20 +571,20 @@ class FaceAnalyzer:
             candidate_label = expressive_label
             candidate_score = float(expressive_score)
         else:
-            candidate_label = "Notr"
+            candidate_label = "Sakin"
             candidate_score = neutral_score
 
-        valid_expressions = {"Notr": neutral_score, **expressive_scores}
-        current_label = track.top_label_state or "Notr"
+        valid_expressions = {"Sakin": neutral_score, **expressive_scores}
+        current_label = track.top_label_state or "Sakin"
         current_score = float(valid_expressions.get(current_label, 0.0))
 
-        if candidate_label != "Notr" and candidate_score < self.config.emotion_label_threshold:
-            if current_label != "Notr" and current_score >= self.config.emotion_label_hold_threshold:
+        if candidate_label != "Sakin" and candidate_score < self.config.emotion_label_threshold:
+            if current_label != "Sakin" and current_score >= self.config.emotion_label_hold_threshold:
                 return current_label
-            track.top_label_state = "Notr"
-            track.label_candidate = "Notr"
+            track.top_label_state = "Sakin"
+            track.label_candidate = "Sakin"
             track.label_candidate_frames = 0
-            return "Notr"
+            return "Sakin"
 
         if candidate_label == current_label:
             track.label_candidate = candidate_label
@@ -593,15 +593,15 @@ class FaceAnalyzer:
             return candidate_label
 
         should_switch = (
-            candidate_label == "Notr"
-            or current_label == "Notr"
+            candidate_label == "Sakin"
+            or current_label == "Sakin"
             or candidate_score >= current_score + self.config.emotion_label_switch_margin
             or current_score < self.config.emotion_label_hold_threshold
         )
         if not should_switch:
             return current_label
 
-        if current_label == "Notr" and candidate_label != "Notr":
+        if current_label == "Sakin" and candidate_label != "Sakin":
             track.top_label_state = candidate_label
             track.label_candidate = candidate_label
             track.label_candidate_frames = 0
