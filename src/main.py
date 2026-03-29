@@ -25,8 +25,11 @@ HOLD_AFTER_LOSS_SECONDS = 1.1
 FPS_SMOOTHING_ALPHA = 0.2
 CHALLENGE_SMILE_THRESHOLD = 0.55
 CHALLENGE_SMILE_HOLD_SECONDS = 3.0
+STATUE_TILT_HOLD_SECONDS = 2.0
 CHALLENGE_INVITE_DELAY_SECONDS = 10.0
 CHALLENGE_TASK_SECONDS = 5.0
+STATUE_CHALLENGE_SECONDS = 8.0
+CHALLENGE_COUNTDOWN_SECONDS = 5.0
 CHALLENGE_RESULT_SECONDS = 8.5
 CHALLENGE_COOLDOWN_SECONDS = 15.0
 CHALLENGE_TASKS = (
@@ -35,6 +38,8 @@ CHALLENGE_TASKS = (
     ("Kızgın görün", "angry", (70, 95, 255)),
     ("Üzgün görün", "sad", (245, 150, 80)),
 )
+STATUE_ACCENT = (80, 200, 255)
+STATUE_TRIGGER_MIN_SCORE = 0.78
 
 
 def _turkish_upper(text: str) -> str:
@@ -139,9 +144,12 @@ def main() -> None:
     last_face_snapshot: Optional[FaceAnalysis] = None
     active_face_id: Optional[int] = None
     smile_hold_started_at: Optional[float] = None
+    tilt_hold_started_at: Optional[float] = None
     challenge_invite_started_at: Optional[float] = None
     challenge_cooldown_until: Optional[float] = None
     challenge_state = "idle"
+    challenge_kind = ""
+    challenge_countdown_started_at: Optional[float] = None
     challenge_started_at: Optional[float] = None
     challenge_result_until: Optional[float] = None
     challenge_task_index = 0
@@ -149,6 +157,12 @@ def main() -> None:
     challenge_best_task_label = ""
     challenge_best_task_score = 0.0
     challenge_final_score = 0.0
+    statue_live_score = 0.0
+    statue_score_total = 0.0
+    statue_score_samples = 0
+    last_face_center: Optional[tuple[float, float]] = None
+    last_face_scale = 1.0
+    last_face_track_id: Optional[int] = None
 
     cv2.namedWindow(config.window_name, cv2.WINDOW_NORMAL)
 
@@ -184,6 +198,8 @@ def main() -> None:
             face_for_overlay: Optional[FaceAnalysis] = None
             status_face: Optional[FaceAnalysis] = None
             dwell_time = 0.0
+            face_motion = 1.0
+            face_roll = 0.0
 
             if primary_face is not None:
                 if primary_face.face_id != active_face_id:
@@ -203,6 +219,21 @@ def main() -> None:
                     dwell_time = now - live_start
                 tracking_ready = primary_face.metrics["tracking_confidence"] >= 0.6
                 mode = "tracking" if dwell_time >= ENGAGE_AFTER_SECONDS and tracking_ready else "acquiring"
+                face_motion = _face_motion_delta(
+                    bbox=primary_face.bbox,
+                    track_id=primary_face.face_id,
+                    previous_track_id=last_face_track_id,
+                    previous_center=last_face_center,
+                    previous_scale=last_face_scale,
+                )
+                face_roll = _face_roll_degrees(primary_face.points)
+                last_face_center = _bbox_center(primary_face.bbox)
+                last_face_scale = max(
+                    float(primary_face.bbox[2] - primary_face.bbox[0]),
+                    float(primary_face.bbox[3] - primary_face.bbox[1]),
+                    1.0,
+                )
+                last_face_track_id = primary_face.face_id
             else:
                 if (
                     last_face_snapshot is not None
@@ -215,6 +246,8 @@ def main() -> None:
                     live_face_started_at = None
                     last_face_snapshot = None
                     challenge_cooldown_until = None
+                    last_face_center = None
+                    last_face_track_id = None
 
             challenge_invite_eligible = (
                 challenge_state == "idle"
@@ -244,52 +277,108 @@ def main() -> None:
                             smile_hold_started_at = now
                         hold_seconds = now - smile_hold_started_at
                         if hold_seconds >= CHALLENGE_SMILE_HOLD_SECONDS:
-                            challenge_state = "active"
-                            challenge_started_at = now
+                            challenge_state = "countdown"
+                            challenge_kind = "emotion"
+                            challenge_countdown_started_at = now
+                            challenge_started_at = None
                             challenge_result_until = None
                             challenge_invite_started_at = None
                             challenge_task_index = 0
                             challenge_task_scores = [0.0 for _ in CHALLENGE_TASKS]
-                            challenge_task_scores[0] = float(
-                                primary_face.metrics.get(CHALLENGE_TASKS[0][1], 0.0)
-                            )
                             challenge_best_task_label = ""
                             challenge_best_task_score = 0.0
                             challenge_final_score = 0.0
+                            statue_live_score = 0.0
+                            statue_score_total = 0.0
+                            statue_score_samples = 0
                             smile_hold_started_at = None
+                            tilt_hold_started_at = None
                     else:
                         smile_hold_started_at = None
+                    if challenge_state == "idle" and _statue_trigger_ready(primary_face, face_roll):
+                        if tilt_hold_started_at is None:
+                            tilt_hold_started_at = now
+                        tilt_hold_seconds = now - tilt_hold_started_at
+                        if tilt_hold_seconds >= STATUE_TILT_HOLD_SECONDS:
+                            challenge_state = "countdown"
+                            challenge_kind = "statue"
+                            challenge_countdown_started_at = now
+                            challenge_started_at = None
+                            challenge_result_until = None
+                            challenge_invite_started_at = None
+                            challenge_task_index = 0
+                            challenge_task_scores = [0.0 for _ in CHALLENGE_TASKS]
+                            challenge_best_task_label = ""
+                            challenge_best_task_score = 0.0
+                            challenge_final_score = 0.0
+                            statue_live_score = 0.0
+                            statue_score_total = 0.0
+                            statue_score_samples = 0
+                            smile_hold_started_at = None
+                            tilt_hold_started_at = None
+                    else:
+                        tilt_hold_started_at = None
                 else:
                     smile_hold_started_at = None
+                    tilt_hold_started_at = None
+            elif challenge_state == "countdown":
+                mode = "challenge"
+                if (
+                    challenge_countdown_started_at is not None
+                    and now - challenge_countdown_started_at >= CHALLENGE_COUNTDOWN_SECONDS
+                ):
+                    challenge_state = "active"
+                    challenge_started_at = now
+                    challenge_countdown_started_at = None
+                    if challenge_kind == "emotion" and status_face is not None:
+                        challenge_task_scores[0] = float(
+                            status_face.metrics.get(CHALLENGE_TASKS[0][1], 0.0)
+                        )
             elif challenge_state == "active":
                 mode = "challenge"
                 elapsed = 0.0 if challenge_started_at is None else now - challenge_started_at
-                challenge_task_index = min(
-                    int(elapsed / CHALLENGE_TASK_SECONDS),
-                    len(CHALLENGE_TASKS) - 1,
-                )
-                current_task = CHALLENGE_TASKS[challenge_task_index]
-                if status_face is not None:
-                    challenge_task_scores[challenge_task_index] = max(
-                        challenge_task_scores[challenge_task_index],
-                        float(status_face.metrics.get(current_task[1], 0.0)),
+                if challenge_kind == "emotion":
+                    challenge_task_index = min(
+                        int(elapsed / CHALLENGE_TASK_SECONDS),
+                        len(CHALLENGE_TASKS) - 1,
                     )
-                if challenge_started_at is not None and elapsed >= len(CHALLENGE_TASKS) * CHALLENGE_TASK_SECONDS:
-                    best_index = max(
-                        range(len(challenge_task_scores)),
-                        key=lambda index: challenge_task_scores[index],
-                    )
-                    challenge_state = "result"
-                    challenge_best_task_label = CHALLENGE_TASKS[best_index][0]
-                    challenge_best_task_score = challenge_task_scores[best_index]
-                    challenge_final_score = sum(challenge_task_scores) / max(len(challenge_task_scores), 1)
-                    challenge_result_until = now + CHALLENGE_RESULT_SECONDS
-                    challenge_started_at = None
-                    challenge_invite_started_at = None
+                    current_task = CHALLENGE_TASKS[challenge_task_index]
+                    if status_face is not None:
+                        challenge_task_scores[challenge_task_index] = max(
+                            challenge_task_scores[challenge_task_index],
+                            float(status_face.metrics.get(current_task[1], 0.0)),
+                        )
+                    if challenge_started_at is not None and elapsed >= len(CHALLENGE_TASKS) * CHALLENGE_TASK_SECONDS:
+                        best_index = max(
+                            range(len(challenge_task_scores)),
+                            key=lambda index: challenge_task_scores[index],
+                        )
+                        challenge_state = "result"
+                        challenge_best_task_label = CHALLENGE_TASKS[best_index][0]
+                        challenge_best_task_score = challenge_task_scores[best_index]
+                        challenge_final_score = sum(challenge_task_scores) / max(len(challenge_task_scores), 1)
+                        challenge_result_until = now + CHALLENGE_RESULT_SECONDS
+                        challenge_started_at = None
+                        challenge_invite_started_at = None
+                elif challenge_kind == "statue":
+                    if status_face is not None:
+                        statue_live_score = _statue_frame_score(status_face, face_motion)
+                        statue_score_total += statue_live_score
+                        statue_score_samples += 1
+                    if challenge_started_at is not None and elapsed >= STATUE_CHALLENGE_SECONDS:
+                        challenge_state = "result"
+                        challenge_final_score = (
+                            statue_score_total / max(statue_score_samples, 1)
+                        )
+                        challenge_result_until = now + CHALLENGE_RESULT_SECONDS
+                        challenge_started_at = None
+                        challenge_invite_started_at = None
             elif challenge_state == "result":
                 mode = "challenge_result"
                 if challenge_result_until is not None and now >= challenge_result_until:
                     challenge_state = "idle"
+                    challenge_kind = ""
+                    challenge_countdown_started_at = None
                     challenge_result_until = None
                     challenge_cooldown_until = now + CHALLENGE_COOLDOWN_SECONDS
                     challenge_task_index = 0
@@ -297,22 +386,29 @@ def main() -> None:
                     challenge_best_task_label = ""
                     challenge_best_task_score = 0.0
                     challenge_final_score = 0.0
+                    statue_live_score = 0.0
+                    statue_score_total = 0.0
+                    statue_score_samples = 0
                     challenge_invite_started_at = None
                     smile_hold_started_at = None
+                    tilt_hold_started_at = None
 
-            output = draw_overlay(
-                frame=frame,
-                analyses=[face_for_overlay] if face_for_overlay is not None else [],
-                fps=display_fps,
-                draw_landmarks=draw_landmarks and face_for_overlay is not None,
-            )
-            _draw_runtime_chrome(
-                frame=output,
-                mode=mode,
-                fps=display_fps,
-                face=status_face,
-                draw_landmarks=draw_landmarks,
-            )
+            if challenge_state == "countdown":
+                output = frame.copy()
+            else:
+                output = draw_overlay(
+                    frame=frame,
+                    analyses=[face_for_overlay] if face_for_overlay is not None else [],
+                    fps=display_fps,
+                    draw_landmarks=draw_landmarks and face_for_overlay is not None,
+                )
+                _draw_runtime_chrome(
+                    frame=output,
+                    mode=mode,
+                    fps=display_fps,
+                    face=status_face,
+                    draw_landmarks=draw_landmarks,
+                )
             challenge_invite_visible = (
                 challenge_state == "idle"
                 and status_face is not None
@@ -320,37 +416,62 @@ def main() -> None:
                 and now - challenge_invite_started_at >= CHALLENGE_INVITE_DELAY_SECONDS
             )
             if challenge_invite_visible:
-                hold_progress = 0.0
+                smile_progress = 0.0
                 if smile_hold_started_at is not None:
-                    hold_progress = min(
+                    smile_progress = min(
                         (now - smile_hold_started_at) / CHALLENGE_SMILE_HOLD_SECONDS,
                         1.0,
                     )
-                _draw_challenge_invite(output, hold_progress)
+                tilt_progress = 0.0
+                if tilt_hold_started_at is not None:
+                    tilt_progress = min(
+                        (now - tilt_hold_started_at) / STATUE_TILT_HOLD_SECONDS,
+                        1.0,
+                    )
+                _draw_challenge_invite(output, smile_progress)
+                _draw_statue_invite(output, tilt_progress)
+            elif challenge_state == "countdown":
+                countdown_elapsed = 0.0
+                if challenge_countdown_started_at is not None:
+                    countdown_elapsed = now - challenge_countdown_started_at
+                _draw_challenge_countdown(
+                    output,
+                    challenge_kind=challenge_kind,
+                    elapsed_seconds=countdown_elapsed,
+                )
             elif challenge_state == "active":
-                current_label, _metric_name, current_color = CHALLENGE_TASKS[challenge_task_index]
-                remaining = CHALLENGE_TASK_SECONDS
-                if challenge_started_at is not None:
-                    elapsed = now - challenge_started_at
-                    current_elapsed = elapsed - challenge_task_index * CHALLENGE_TASK_SECONDS
-                    remaining = max(CHALLENGE_TASK_SECONDS - current_elapsed, 0.0)
-                _draw_challenge_active(
-                    output,
-                    task_label=current_label,
-                    task_index=challenge_task_index,
-                    task_count=len(CHALLENGE_TASKS),
-                    remaining_seconds=remaining,
-                    task_score=challenge_task_scores[challenge_task_index],
-                    color=current_color,
-                )
+                if challenge_kind == "emotion":
+                    current_label, _metric_name, current_color = CHALLENGE_TASKS[challenge_task_index]
+                    remaining = CHALLENGE_TASK_SECONDS
+                    if challenge_started_at is not None:
+                        elapsed = now - challenge_started_at
+                        current_elapsed = elapsed - challenge_task_index * CHALLENGE_TASK_SECONDS
+                        remaining = max(CHALLENGE_TASK_SECONDS - current_elapsed, 0.0)
+                    _draw_challenge_active(
+                        output,
+                        task_label=current_label,
+                        task_index=challenge_task_index,
+                        task_count=len(CHALLENGE_TASKS),
+                        remaining_seconds=remaining,
+                        task_score=challenge_task_scores[challenge_task_index],
+                        color=current_color,
+                    )
+                elif challenge_kind == "statue":
+                    remaining = STATUE_CHALLENGE_SECONDS
+                    if challenge_started_at is not None:
+                        remaining = max(STATUE_CHALLENGE_SECONDS - (now - challenge_started_at), 0.0)
+                    _draw_statue_active(output, remaining, statue_live_score)
             elif challenge_state == "result":
-                _draw_challenge_result(
-                    output,
-                    best_label=challenge_best_task_label,
-                    best_score=challenge_best_task_score,
-                    average_score=challenge_final_score,
-                    best_color=_challenge_label_color(challenge_best_task_label),
-                )
+                if challenge_kind == "emotion":
+                    _draw_challenge_result(
+                        output,
+                        best_label=challenge_best_task_label,
+                        best_score=challenge_best_task_score,
+                        average_score=challenge_final_score,
+                        best_color=_challenge_label_color(challenge_best_task_label),
+                    )
+                elif challenge_kind == "statue":
+                    _draw_statue_result(output, challenge_final_score)
 
             cv2.imshow(config.window_name, output)
             if target_frame_time > 0.0:
@@ -579,6 +700,12 @@ def _draw_hud_card(
     cv2.rectangle(frame, (x1, y1), (x2, y1 + 4), accent, -1)
 
 
+def _left_hud_rect(frame, card_w: int, card_h: int) -> tuple[int, int, int, int]:
+    x1 = 22
+    y1 = 22
+    return x1, y1, x1 + card_w, y1 + card_h
+
+
 def _challenge_label_color(label: str) -> tuple[int, int, int]:
     for task_label, _metric_name, color in CHALLENGE_TASKS:
         if task_label == label:
@@ -614,6 +741,32 @@ def _draw_challenge_invite(frame, progress: float) -> None:
     cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (58, 64, 72), -1)
     fill_w = int((bar_x2 - bar_x1) * progress)
     cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), (255, 205, 80), -1)
+
+
+def _draw_statue_invite(frame, progress: float) -> None:
+    progress = max(0.0, min(1.0, progress))
+    card_w = min(390, frame.shape[1] - 48)
+    card_h = 132
+    x1, y1, x2, y2 = _left_hud_rect(frame, card_w, card_h)
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=STATUE_ACCENT)
+    draw_text(frame, "HEYKEL YARIŞMASI", (x1 + 18, y1 + 14), 14, STATUE_ACCENT)
+    draw_text(frame, "Başını yana eğ", (x1 + 18, y1 + 36), 28, (255, 255, 255))
+    draw_text(
+        frame,
+        "2 saniye tut, heykel yarışması başlasın",
+        (x1 + 18, y1 + 82),
+        18,
+        (220, 226, 232),
+    )
+
+    bar_x1 = x1 + 22
+    bar_x2 = x2 - 22
+    bar_y1 = y2 - 22
+    bar_h = 10
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (58, 64, 72), -1)
+    fill_w = int((bar_x2 - bar_x1) * progress)
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), STATUE_ACCENT, -1)
 
 
 def _draw_challenge_active(
@@ -660,6 +813,74 @@ def _draw_challenge_active(
     cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), color, -1)
 
 
+def _draw_statue_active(frame, remaining_seconds: float, live_score: float) -> None:
+    card_w = min(390, frame.shape[1] - 48)
+    card_h = 154
+    x1, y1, x2, y2 = _left_hud_rect(frame, card_w, card_h)
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=STATUE_ACCENT)
+    draw_text(frame, "HEYKEL YARIŞMASI", (x1 + 18, y1 + 14), 14, STATUE_ACCENT)
+    draw_text(frame, "Kıpırdama", (x1 + 18, y1 + 36), 32, (255, 255, 255))
+    draw_text(
+        frame,
+        f"Kalan süre {remaining_seconds:0.1f} sn",
+        (x1 + 18, y1 + 82),
+        18,
+        (220, 226, 232),
+    )
+    draw_text(
+        frame,
+        f"Sakinlik skorun %{live_score * 100:0.0f}",
+        (x1 + 18, y1 + 108),
+        18,
+        STATUE_ACCENT,
+    )
+    bar_x1 = x1 + 26
+    bar_x2 = x2 - 26
+    bar_y1 = y2 - 28
+    bar_h = 10
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (58, 64, 72), -1)
+    fill_w = int((bar_x2 - bar_x1) * max(0.0, min(1.0, live_score)))
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), STATUE_ACCENT, -1)
+
+
+def _draw_challenge_countdown(
+    frame,
+    challenge_kind: str,
+    elapsed_seconds: float,
+) -> None:
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (6, 8, 12), -1)
+    cv2.addWeighted(overlay, 0.84, frame, 0.16, 0.0, frame)
+
+    if challenge_kind == "statue":
+        accent = STATUE_ACCENT
+        title = "Heykel Yarışması"
+    else:
+        accent = (255, 205, 80)
+        title = "Duygu Yarışı"
+
+    remaining = max(CHALLENGE_COUNTDOWN_SECONDS - elapsed_seconds, 0.0)
+    countdown_number = max(1, int(math.ceil(remaining)))
+    center_x = frame.shape[1] // 2
+    center_y = frame.shape[0] // 2
+
+    phase = elapsed_seconds - math.floor(elapsed_seconds)
+    flash = 0.70 + 0.30 * abs(math.sin(phase * math.pi))
+    ring_radius = 138 + int((1.0 - min(remaining / CHALLENGE_COUNTDOWN_SECONDS, 1.0)) * 34)
+    glow_radius = ring_radius + 18
+
+    glow = frame.copy()
+    cv2.circle(glow, (center_x, center_y + 8), glow_radius, accent, -1, cv2.LINE_AA)
+    cv2.addWeighted(glow, 0.10 * flash, frame, 1.0 - (0.10 * flash), 0.0, frame)
+    cv2.circle(frame, (center_x, center_y + 8), ring_radius, accent, 5, cv2.LINE_AA)
+
+    _draw_centered_text(frame, "Hazır mısın?", center_y - 150, 40, (255, 255, 255))
+    _draw_centered_text(frame, title, center_y - 96, 28, accent)
+    _draw_centered_text(frame, str(countdown_number), center_y + 44, 198, (255, 255, 255))
+    _draw_centered_text(frame, "Başlıyor", center_y + 138, 24, (230, 236, 242))
+
+
 def _draw_challenge_result(
     frame,
     best_label: str,
@@ -698,6 +919,30 @@ def _draw_challenge_result(
         (x1 + 18, y1 + 142),
         18,
         (200, 206, 214),
+    )
+
+
+def _draw_statue_result(frame, final_score: float) -> None:
+    card_w = min(390, frame.shape[1] - 48)
+    card_h = 158
+    x1, y1, x2, y2 = _left_hud_rect(frame, card_w, card_h)
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=STATUE_ACCENT)
+    draw_text(frame, "HEYKEL YARIŞMASI", (x1 + 18, y1 + 14), 14, STATUE_ACCENT)
+    draw_text(frame, "HEYKEL SKORUN", (x1 + 18, y1 + 34), 18, (220, 226, 232))
+    draw_text(
+        frame,
+        f"%{final_score * 100:0.0f}",
+        (x1 + 18, y1 + 54),
+        44,
+        STATUE_ACCENT,
+    )
+    draw_text(
+        frame,
+        "Yüzünü oldukça sabit tuttun",
+        (x1 + 18, y1 + 114),
+        20,
+        (255, 255, 255),
     )
 
 
@@ -762,6 +1007,77 @@ def _draw_standby_chips(frame, y: int) -> None:
         cv2.rectangle(frame, (x, y), (x + width, y + height), color, 1)
         draw_text(frame, label, (x + 14, y + 8), 20, (245, 245, 245))
         x += width + 14
+
+
+def _bbox_center(bbox: tuple[int, int, int, int]) -> tuple[float, float]:
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _face_motion_delta(
+    bbox: tuple[int, int, int, int],
+    track_id: int,
+    previous_track_id: Optional[int],
+    previous_center: Optional[tuple[float, float]],
+    previous_scale: float,
+) -> float:
+    if previous_track_id != track_id or previous_center is None:
+        return 1.0
+    center_x, center_y = _bbox_center(bbox)
+    dx = center_x - previous_center[0]
+    dy = center_y - previous_center[1]
+    current_scale = max(float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1]), 1.0)
+    scale = max((current_scale + previous_scale) * 0.5, 1.0)
+    center_motion = math.hypot(dx, dy) / scale
+    scale_motion = abs(current_scale - previous_scale) / scale
+    return max(center_motion, scale_motion * 0.85)
+
+
+def _face_roll_degrees(points) -> float:
+    left_eye = points[33]
+    right_eye = points[263]
+    dx = float(right_eye[0] - left_eye[0])
+    dy = float(right_eye[1] - left_eye[1])
+    return math.degrees(math.atan2(dy, max(abs(dx), 1e-6)))
+
+
+def _statue_trigger_ready(face: FaceAnalysis, face_roll_degrees: float) -> bool:
+    metrics = face.metrics
+    readiness_score = max(
+        0.0,
+        min(
+            1.0,
+            float(metrics.get("neutral", 0.0)) * 0.55
+            + float(metrics.get("tracking_confidence", 0.0)) * 0.30
+            + float(metrics.get("presence", 0.0)) * 0.15,
+        ),
+    )
+    return (
+        abs(face_roll_degrees) >= 12.0
+        and readiness_score >= STATUE_TRIGGER_MIN_SCORE
+    )
+
+
+def _statue_frame_score(face: FaceAnalysis, motion_delta: float) -> float:
+    metrics = face.metrics
+    motion_score = max(0.0, min(1.0, 1.0 - (motion_delta / 0.020)))
+    calm_score = max(0.0, min(1.0, float(metrics.get("neutral", 0.0))))
+    mouth_score = max(
+        0.0,
+        min(1.0, 1.0 - (float(metrics.get("mouth_open", 0.0)) / 0.22)),
+    )
+    tracking_score = max(0.0, min(1.0, float(metrics.get("tracking_confidence", 0.0))))
+    base_score = (
+        motion_score * 0.70
+        + calm_score * 0.16
+        + mouth_score * 0.07
+        + tracking_score * 0.07
+    )
+    if motion_delta >= 0.030:
+        base_score *= 0.35
+    elif motion_delta >= 0.020:
+        base_score *= 0.55
+    return max(0.0, min(1.0, base_score))
 
 
 def _draw_centered_text(
