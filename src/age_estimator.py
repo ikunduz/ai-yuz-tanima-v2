@@ -221,10 +221,12 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
         self.dtype = torch.float16 if self.device.type != "cpu" else torch.float32
 
         cache_dir = config.age_mivolo_cache_dir
+        local_files_only = self._has_cached_model_files(cache_dir)
         self.config = AutoConfig.from_pretrained(
             config.age_mivolo_model_id,
             trust_remote_code=True,
             cache_dir=cache_dir,
+            local_files_only=local_files_only,
         )
 
         try:
@@ -233,6 +235,7 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
                 trust_remote_code=True,
                 cache_dir=cache_dir,
                 torch_dtype=self.dtype,
+                local_files_only=local_files_only,
             )
         except Exception:
             if self.device.type == "mps" and self.dtype == torch.float16:
@@ -242,6 +245,7 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
                     trust_remote_code=True,
                     cache_dir=cache_dir,
                     torch_dtype=self.dtype,
+                    local_files_only=local_files_only,
                 )
             else:
                 raise
@@ -251,6 +255,13 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
         self.input_size = int(getattr(self.config, "input_size", 384))
         self.mean = IMAGENET_MEAN
         self.std = IMAGENET_STD
+
+    @staticmethod
+    def _has_cached_model_files(cache_dir: str) -> bool:
+        cache_path = Path(cache_dir)
+        if not cache_path.exists():
+            return False
+        return any(cache_path.rglob("config.json"))
 
     @staticmethod
     def _resolve_device_name(preference: str) -> str:

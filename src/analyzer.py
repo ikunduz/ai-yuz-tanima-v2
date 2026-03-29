@@ -43,6 +43,11 @@ class TrackedFace:
     bbox: tuple[int, int, int, int]
     smoother: "MetricSmoother"
     emotion_scores: Optional[Dict[str, float]] = None
+    emotion_confidence: float = 0.0
+    emotion_margin: float = 0.0
+    top_label_state: str = "Notr"
+    label_candidate: str = "Notr"
+    label_candidate_frames: int = 0
     last_emotion_inference_ms: int = 0
     age_smoother: Optional["ScalarSmoother"] = None
     age_years: Optional[float] = None
@@ -164,6 +169,8 @@ class FaceAnalyzer:
                     frame_rgb=frame_rgb,
                     bbox=bbox,
                     points=points,
+                    center=center,
+                    base_metrics=metrics,
                     timestamp_ms=timestamp_ms,
                 )
             )
@@ -198,20 +205,7 @@ class FaceAnalyzer:
                 timestamp_ms=timestamp_ms,
             )
 
-            # top_label calculation for UI (User requested 30% threshold)
-            valid_expressions = {
-                "Notr": smoothed_metrics.get("neutral", 0.0),
-                "Mutlu": smoothed_metrics.get("happy", 0.0),
-                "Saskin": smoothed_metrics.get("surprised", 0.0),
-                "Kizgin": smoothed_metrics.get("angry", 0.0),
-                "Uzgun": smoothed_metrics.get("sad", 0.0),
-            }
-            top_label = max(valid_expressions.items(), key=lambda item: item[1])
-            final_label = (
-                top_label[0]
-                if top_label[0] == "Notr" or top_label[1] >= 0.30
-                else "Notr"
-            )
+            final_label = self._resolve_top_label(track, smoothed_metrics)
 
             analyses.append(
                 FaceAnalysis(
@@ -244,6 +238,20 @@ class FaceAnalyzer:
             "angry": 0.0,
             "sad": 0.0,
             "neutral": 1.0,
+        }
+
+    def _rule_emotion_scores(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        happy = self._clamp(metrics.get("happy", 0.0))
+        surprised = self._clamp(metrics.get("surprised", 0.0))
+        angry = self._clamp(metrics.get("angry", 0.0))
+        sad = self._clamp(metrics.get("sad", 0.0))
+        neutral = self._clamp(1.0 - max(happy, surprised, angry, sad))
+        return {
+            "happy": happy,
+            "surprised": surprised,
+            "angry": angry,
+            "sad": sad,
+            "neutral": neutral,
         }
 
     @staticmethod
@@ -322,65 +330,296 @@ class FaceAnalyzer:
         frame_rgb: np.ndarray,
         bbox: tuple[int, int, int, int],
         points: np.ndarray,
+        center: np.ndarray,
+        base_metrics: Dict[str, float],
         timestamp_ms: int,
     ) -> Dict[str, float]:
+        rule_scores = self._rule_emotion_scores(base_metrics)
         if self.emotion_estimator is None:
-            neutral_score = self._clamp(
-                1.0
-                - max(
-                    track.smoother.state.get("happy", 0.0),
-                    track.smoother.state.get("surprised", 0.0),
-                    track.smoother.state.get("angry", 0.0),
-                    track.smoother.state.get("sad", 0.0),
-                )
-            )
-            return {"neutral": neutral_score}
+            return {"neutral": rule_scores["neutral"]}
 
-        cached_scores = dict(track.emotion_scores or self._default_emotion_scores())
+        cached_scores = dict(track.emotion_scores or rule_scores)
         face_width = bbox[2] - bbox[0]
         if face_width < self.config.emotion_min_face_width:
-            return cached_scores
+            return self._blend_emotion_sources(
+                rule_scores=rule_scores,
+                model_scores=cached_scores,
+                confidence=track.emotion_confidence,
+                margin=track.emotion_margin,
+                frame_quality=0.0,
+                mouth_open=base_metrics.get("mouth_open", 0.0),
+                eye_open=base_metrics.get("eye_open", 0.0),
+            )
+
+        motion_delta = self._age_motion_delta(track, center, bbox)
+        yaw_ratio, roll_degrees = self._age_pose_metrics(points)
+        frame_quality = self._emotion_frame_quality(
+            motion_delta=motion_delta,
+            yaw_ratio=yaw_ratio,
+            roll_degrees=roll_degrees,
+        )
 
         should_refresh = (
             track.last_emotion_inference_ms == 0
             or timestamp_ms - track.last_emotion_inference_ms
             >= self.config.emotion_inference_interval_ms
         )
-        if not should_refresh:
-            return cached_scores
-
-        aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
-        face_crop = self._extract_age_crop(
-            frame_rgb=frame_rgb,
-            bbox=bbox,
-            padding_ratio=self.config.emotion_crop_padding_ratio,
-            top_bias_ratio=self.config.emotion_crop_top_bias_ratio,
-        )
-        input_crop = aligned_crop if aligned_crop is not None else face_crop
-        if input_crop is None or input_crop.size == 0:
-            return cached_scores
-
-        prediction = self.emotion_estimator.predict(input_crop)
-        if prediction is None:
-            return cached_scores
-
-        merged_scores = self._default_emotion_scores()
-        for key, value in prediction.scores.items():
-            merged_scores[key] = self._clamp(float(value))
-        if "neutral" not in prediction.scores:
-            merged_scores["neutral"] = self._clamp(
-                1.0
-                - max(
-                    merged_scores["happy"],
-                    merged_scores["surprised"],
-                    merged_scores["angry"],
-                    merged_scores["sad"],
-                )
+        if should_refresh:
+            aligned_crop = self._extract_aligned_age_crop(frame_rgb, points)
+            face_crop = self._extract_age_crop(
+                frame_rgb=frame_rgb,
+                bbox=bbox,
+                padding_ratio=self.config.emotion_crop_padding_ratio,
+                top_bias_ratio=self.config.emotion_crop_top_bias_ratio,
+            )
+            context_crop = self._extract_age_crop(
+                frame_rgb=frame_rgb,
+                bbox=bbox,
+                padding_ratio=self.config.emotion_context_padding_ratio,
+                top_bias_ratio=self.config.emotion_context_top_bias_ratio,
             )
 
-        track.last_emotion_inference_ms = timestamp_ms
-        track.emotion_scores = merged_scores
-        return merged_scores
+            prediction = self.emotion_estimator.predict(
+                face_rgb=face_crop,
+                aligned_face_rgb=aligned_crop,
+                context_rgb=context_crop,
+            )
+            if prediction is not None:
+                cached_scores = self._calibrate_emotion_prediction(
+                    model_scores=prediction.scores,
+                    rule_scores=rule_scores,
+                    mouth_open=base_metrics.get("mouth_open", 0.0),
+                    eye_open=base_metrics.get("eye_open", 0.0),
+                    frame_quality=frame_quality,
+                )
+                track.emotion_scores = cached_scores
+                track.emotion_confidence = prediction.confidence
+                track.emotion_margin = prediction.margin
+                track.last_emotion_inference_ms = timestamp_ms
+
+        return self._blend_emotion_sources(
+            rule_scores=rule_scores,
+            model_scores=cached_scores,
+            confidence=track.emotion_confidence,
+            margin=track.emotion_margin,
+            frame_quality=frame_quality,
+            mouth_open=base_metrics.get("mouth_open", 0.0),
+            eye_open=base_metrics.get("eye_open", 0.0),
+        )
+
+    def _emotion_frame_quality(
+        self,
+        motion_delta: float,
+        yaw_ratio: float,
+        roll_degrees: float,
+    ) -> float:
+        motion_quality = 1.0 - self._clamp(
+            motion_delta / max(self.config.emotion_stability_max_motion, 1e-6)
+        )
+        yaw_quality = 1.0 - self._clamp(
+            yaw_ratio / max(self.config.emotion_stability_max_yaw_ratio, 1e-6)
+        )
+        roll_quality = 1.0 - self._clamp(
+            roll_degrees / max(self.config.emotion_stability_max_roll_degrees, 1e-6)
+        )
+        return self._clamp(
+            motion_quality * 0.42
+            + yaw_quality * 0.33
+            + roll_quality * 0.25
+        )
+
+    def _calibrate_emotion_prediction(
+        self,
+        model_scores: Dict[str, float],
+        rule_scores: Dict[str, float],
+        mouth_open: float,
+        eye_open: float,
+        frame_quality: float,
+    ) -> Dict[str, float]:
+        talking_penalty = self._clamp((mouth_open - 0.34) / 0.28) * self._clamp(
+            (0.20 - rule_scores["surprised"]) / 0.20
+        )
+        narrow_eye_penalty = self._clamp((0.40 - eye_open) / 0.30)
+
+        calibrated = {
+            "happy": self._clamp(
+                model_scores.get("happy", 0.0) * 0.94
+                + rule_scores["happy"] * 0.06
+                - rule_scores["angry"] * 0.04
+            ),
+            "surprised": self._clamp(
+                model_scores.get("surprised", 0.0) * (1.0 - talking_penalty * 0.32)
+                * (1.0 - narrow_eye_penalty * 0.12)
+                + rule_scores["surprised"] * 0.10
+            ),
+            "angry": self._clamp(
+                model_scores.get("angry", 0.0)
+                + rule_scores["angry"] * 0.14
+                - rule_scores["happy"] * 0.12
+                - rule_scores["surprised"] * 0.05
+            ),
+            "sad": self._clamp(
+                model_scores.get("sad", 0.0)
+                + rule_scores["sad"] * 0.16
+                - rule_scores["happy"] * 0.10
+                - rule_scores["surprised"] * 0.08
+            ),
+            "neutral": self._clamp(
+                model_scores.get("neutral", 0.0) * (0.90 + frame_quality * 0.10)
+                + rule_scores["neutral"] * 0.10
+            ),
+        }
+        calibrated["neutral"] = self._clamp(
+            max(
+                calibrated["neutral"],
+                1.0
+                - max(
+                    calibrated["happy"],
+                    calibrated["surprised"],
+                    calibrated["angry"],
+                    calibrated["sad"],
+                ),
+            )
+        )
+        return calibrated
+
+    def _blend_emotion_sources(
+        self,
+        rule_scores: Dict[str, float],
+        model_scores: Dict[str, float],
+        confidence: float,
+        margin: float,
+        frame_quality: float,
+        mouth_open: float,
+        eye_open: float,
+    ) -> Dict[str, float]:
+        confidence_strength = self._clamp((confidence - 0.22) / 0.46)
+        margin_strength = self._clamp(margin / 0.28)
+        model_weight = self._clamp(
+            self.config.emotion_model_base_weight * (0.58 + frame_quality * 0.42)
+            + confidence_strength * 0.10
+            + margin_strength * 0.06,
+            self.config.emotion_model_min_weight,
+            self.config.emotion_model_max_weight,
+        )
+        rule_weight = 1.0 - model_weight
+
+        talking_penalty = self._clamp((mouth_open - 0.34) / 0.28) * self._clamp(
+            (0.18 - rule_scores["surprised"]) / 0.18
+        )
+        low_eye_penalty = self._clamp((0.38 - eye_open) / 0.30)
+
+        happy = self._clamp(
+            model_scores.get("happy", 0.0) * (model_weight + 0.04)
+            + rule_scores["happy"] * max(rule_weight - 0.04, 0.0)
+            - rule_scores["angry"] * 0.05
+        )
+        surprised = self._clamp(
+            (
+                model_scores.get("surprised", 0.0) * max(model_weight - 0.02, 0.0)
+                + rule_scores["surprised"] * min(rule_weight + 0.02, 1.0)
+            )
+            * (1.0 - talking_penalty * 0.34)
+            * (1.0 - low_eye_penalty * 0.12)
+        )
+        angry = self._clamp(
+            model_scores.get("angry", 0.0) * model_weight
+            + rule_scores["angry"] * rule_weight
+            - rule_scores["happy"] * 0.08
+            - rule_scores["sad"] * 0.03
+        )
+        sad = self._clamp(
+            model_scores.get("sad", 0.0) * model_weight
+            + rule_scores["sad"] * rule_weight
+            - rule_scores["happy"] * 0.12
+            - rule_scores["surprised"] * 0.08
+        )
+
+        emotional_peak = max(happy, surprised, angry, sad)
+        neutral = self._clamp(
+            max(
+                model_scores.get("neutral", 0.0) * model_weight
+                + rule_scores["neutral"] * rule_weight,
+                1.0 - emotional_peak * 1.08,
+            )
+        )
+        return {
+            "happy": happy,
+            "surprised": surprised,
+            "angry": angry,
+            "sad": sad,
+            "neutral": neutral,
+        }
+
+    def _resolve_top_label(
+        self,
+        track: TrackedFace,
+        metrics: Dict[str, float],
+    ) -> str:
+        expressive_scores = {
+            "Mutlu": metrics.get("happy", 0.0),
+            "Saskin": metrics.get("surprised", 0.0),
+            "Kizgin": metrics.get("angry", 0.0),
+            "Uzgun": metrics.get("sad", 0.0),
+        }
+        neutral_score = float(metrics.get("neutral", 0.0))
+        expressive_label, expressive_score = max(
+            expressive_scores.items(),
+            key=lambda item: item[1],
+        )
+        if expressive_score >= self.config.emotion_label_threshold:
+            candidate_label = expressive_label
+            candidate_score = float(expressive_score)
+        else:
+            candidate_label = "Notr"
+            candidate_score = neutral_score
+
+        valid_expressions = {"Notr": neutral_score, **expressive_scores}
+        current_label = track.top_label_state or "Notr"
+        current_score = float(valid_expressions.get(current_label, 0.0))
+
+        if candidate_label != "Notr" and candidate_score < self.config.emotion_label_threshold:
+            if current_label != "Notr" and current_score >= self.config.emotion_label_hold_threshold:
+                return current_label
+            track.top_label_state = "Notr"
+            track.label_candidate = "Notr"
+            track.label_candidate_frames = 0
+            return "Notr"
+
+        if candidate_label == current_label:
+            track.label_candidate = candidate_label
+            track.label_candidate_frames = 0
+            track.top_label_state = candidate_label
+            return candidate_label
+
+        should_switch = (
+            candidate_label == "Notr"
+            or current_label == "Notr"
+            or candidate_score >= current_score + self.config.emotion_label_switch_margin
+            or current_score < self.config.emotion_label_hold_threshold
+        )
+        if not should_switch:
+            return current_label
+
+        if current_label == "Notr" and candidate_label != "Notr":
+            track.top_label_state = candidate_label
+            track.label_candidate = candidate_label
+            track.label_candidate_frames = 0
+            return candidate_label
+
+        if track.label_candidate == candidate_label:
+            track.label_candidate_frames += 1
+        else:
+            track.label_candidate = candidate_label
+            track.label_candidate_frames = 1
+
+        if track.label_candidate_frames >= self.config.emotion_label_switch_frames:
+            track.top_label_state = candidate_label
+            track.label_candidate = candidate_label
+            track.label_candidate_frames = 0
+            return candidate_label
+
+        return current_label
 
     def _calibrate_age_prediction(
         self,
