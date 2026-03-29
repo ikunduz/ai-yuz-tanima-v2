@@ -23,6 +23,18 @@ except ImportError:
 ENGAGE_AFTER_SECONDS = 0.45
 HOLD_AFTER_LOSS_SECONDS = 1.1
 FPS_SMOOTHING_ALPHA = 0.2
+CHALLENGE_SMILE_THRESHOLD = 0.55
+CHALLENGE_SMILE_HOLD_SECONDS = 3.0
+CHALLENGE_INVITE_DELAY_SECONDS = 10.0
+CHALLENGE_TASK_SECONDS = 5.0
+CHALLENGE_RESULT_SECONDS = 8.5
+CHALLENGE_COOLDOWN_SECONDS = 15.0
+CHALLENGE_TASKS = (
+    ("Mutlu ol", "happy", (70, 220, 125)),
+    ("Şaşır", "surprised", (75, 200, 255)),
+    ("Kızgın görün", "angry", (70, 95, 255)),
+    ("Üzgün görün", "sad", (245, 150, 80)),
+)
 
 
 def _turkish_upper(text: str) -> str:
@@ -126,6 +138,17 @@ def main() -> None:
     last_face_seen_at = 0.0
     last_face_snapshot: Optional[FaceAnalysis] = None
     active_face_id: Optional[int] = None
+    smile_hold_started_at: Optional[float] = None
+    challenge_invite_started_at: Optional[float] = None
+    challenge_cooldown_until: Optional[float] = None
+    challenge_state = "idle"
+    challenge_started_at: Optional[float] = None
+    challenge_result_until: Optional[float] = None
+    challenge_task_index = 0
+    challenge_task_scores = [0.0 for _ in CHALLENGE_TASKS]
+    challenge_best_task_label = ""
+    challenge_best_task_score = 0.0
+    challenge_final_score = 0.0
 
     cv2.namedWindow(config.window_name, cv2.WINDOW_NORMAL)
 
@@ -160,6 +183,7 @@ def main() -> None:
             mode = "standby"
             face_for_overlay: Optional[FaceAnalysis] = None
             status_face: Optional[FaceAnalysis] = None
+            dwell_time = 0.0
 
             if primary_face is not None:
                 if primary_face.face_id != active_face_id:
@@ -177,8 +201,6 @@ def main() -> None:
                 if live_start is not None:
                     assert live_start is not None
                     dwell_time = now - live_start
-                else:
-                    dwell_time = 0.0
                 tracking_ready = primary_face.metrics["tracking_confidence"] >= 0.6
                 mode = "tracking" if dwell_time >= ENGAGE_AFTER_SECONDS and tracking_ready else "acquiring"
             else:
@@ -192,6 +214,91 @@ def main() -> None:
                     active_face_id = None
                     live_face_started_at = None
                     last_face_snapshot = None
+                    challenge_cooldown_until = None
+
+            challenge_invite_eligible = (
+                challenge_state == "idle"
+                and mode == "tracking"
+                and primary_face is not None
+                and primary_face.age_years is not None
+                and (
+                    challenge_cooldown_until is None
+                    or now >= challenge_cooldown_until
+                )
+            )
+            if challenge_invite_eligible:
+                if challenge_invite_started_at is None:
+                    challenge_invite_started_at = now
+            else:
+                challenge_invite_started_at = None
+
+            if challenge_state == "idle":
+                challenge_invite_ready = (
+                    challenge_invite_started_at is not None
+                    and now - challenge_invite_started_at >= CHALLENGE_INVITE_DELAY_SECONDS
+                )
+                if challenge_invite_ready:
+                    happy_score = float(primary_face.metrics.get("happy", 0.0))
+                    if happy_score >= CHALLENGE_SMILE_THRESHOLD:
+                        if smile_hold_started_at is None:
+                            smile_hold_started_at = now
+                        hold_seconds = now - smile_hold_started_at
+                        if hold_seconds >= CHALLENGE_SMILE_HOLD_SECONDS:
+                            challenge_state = "active"
+                            challenge_started_at = now
+                            challenge_result_until = None
+                            challenge_invite_started_at = None
+                            challenge_task_index = 0
+                            challenge_task_scores = [0.0 for _ in CHALLENGE_TASKS]
+                            challenge_task_scores[0] = float(
+                                primary_face.metrics.get(CHALLENGE_TASKS[0][1], 0.0)
+                            )
+                            challenge_best_task_label = ""
+                            challenge_best_task_score = 0.0
+                            challenge_final_score = 0.0
+                            smile_hold_started_at = None
+                    else:
+                        smile_hold_started_at = None
+                else:
+                    smile_hold_started_at = None
+            elif challenge_state == "active":
+                mode = "challenge"
+                elapsed = 0.0 if challenge_started_at is None else now - challenge_started_at
+                challenge_task_index = min(
+                    int(elapsed / CHALLENGE_TASK_SECONDS),
+                    len(CHALLENGE_TASKS) - 1,
+                )
+                current_task = CHALLENGE_TASKS[challenge_task_index]
+                if status_face is not None:
+                    challenge_task_scores[challenge_task_index] = max(
+                        challenge_task_scores[challenge_task_index],
+                        float(status_face.metrics.get(current_task[1], 0.0)),
+                    )
+                if challenge_started_at is not None and elapsed >= len(CHALLENGE_TASKS) * CHALLENGE_TASK_SECONDS:
+                    best_index = max(
+                        range(len(challenge_task_scores)),
+                        key=lambda index: challenge_task_scores[index],
+                    )
+                    challenge_state = "result"
+                    challenge_best_task_label = CHALLENGE_TASKS[best_index][0]
+                    challenge_best_task_score = challenge_task_scores[best_index]
+                    challenge_final_score = sum(challenge_task_scores) / max(len(challenge_task_scores), 1)
+                    challenge_result_until = now + CHALLENGE_RESULT_SECONDS
+                    challenge_started_at = None
+                    challenge_invite_started_at = None
+            elif challenge_state == "result":
+                mode = "challenge_result"
+                if challenge_result_until is not None and now >= challenge_result_until:
+                    challenge_state = "idle"
+                    challenge_result_until = None
+                    challenge_cooldown_until = now + CHALLENGE_COOLDOWN_SECONDS
+                    challenge_task_index = 0
+                    challenge_task_scores = [0.0 for _ in CHALLENGE_TASKS]
+                    challenge_best_task_label = ""
+                    challenge_best_task_score = 0.0
+                    challenge_final_score = 0.0
+                    challenge_invite_started_at = None
+                    smile_hold_started_at = None
 
             output = draw_overlay(
                 frame=frame,
@@ -206,6 +313,44 @@ def main() -> None:
                 face=status_face,
                 draw_landmarks=draw_landmarks,
             )
+            challenge_invite_visible = (
+                challenge_state == "idle"
+                and status_face is not None
+                and challenge_invite_started_at is not None
+                and now - challenge_invite_started_at >= CHALLENGE_INVITE_DELAY_SECONDS
+            )
+            if challenge_invite_visible:
+                hold_progress = 0.0
+                if smile_hold_started_at is not None:
+                    hold_progress = min(
+                        (now - smile_hold_started_at) / CHALLENGE_SMILE_HOLD_SECONDS,
+                        1.0,
+                    )
+                _draw_challenge_invite(output, hold_progress)
+            elif challenge_state == "active":
+                current_label, _metric_name, current_color = CHALLENGE_TASKS[challenge_task_index]
+                remaining = CHALLENGE_TASK_SECONDS
+                if challenge_started_at is not None:
+                    elapsed = now - challenge_started_at
+                    current_elapsed = elapsed - challenge_task_index * CHALLENGE_TASK_SECONDS
+                    remaining = max(CHALLENGE_TASK_SECONDS - current_elapsed, 0.0)
+                _draw_challenge_active(
+                    output,
+                    task_label=current_label,
+                    task_index=challenge_task_index,
+                    task_count=len(CHALLENGE_TASKS),
+                    remaining_seconds=remaining,
+                    task_score=challenge_task_scores[challenge_task_index],
+                    color=current_color,
+                )
+            elif challenge_state == "result":
+                _draw_challenge_result(
+                    output,
+                    best_label=challenge_best_task_label,
+                    best_score=challenge_best_task_score,
+                    average_score=challenge_final_score,
+                    best_color=_challenge_label_color(challenge_best_task_label),
+                )
 
             cv2.imshow(config.window_name, output)
             if target_frame_time > 0.0:
@@ -261,7 +406,6 @@ def _draw_runtime_chrome(
         _draw_standby_card(frame)
         return
 
-    _draw_top_badges(frame, mode, fps)
     if face is not None:
         accent = (60, 220, 120) if mode == "tracking" else (80, 200, 255)
         _draw_signal_strip(frame, face, accent)
@@ -270,6 +414,10 @@ def _draw_runtime_chrome(
 def _mode_copy(mode: str) -> tuple[tuple[int, int, int], str, str]:
     if mode == "tracking":
         return (60, 220, 120), "TAKİPTE", "Ana yüz sabitlendi"
+    if mode == "challenge":
+        return (255, 205, 80), "YARIŞMA", "Duygu turu devam ediyor"
+    if mode == "challenge_result":
+        return (80, 200, 255), "SONUÇ", "Duygu turu tamamlandı"
     if mode == "acquiring":
         return (80, 200, 255), "ALGILANIYOR", "Yüz takibi oturuyor"
     if mode == "hold":
@@ -301,23 +449,9 @@ def _draw_signal_strip(
     info_x = 160
     draw_text(
         frame,
-        f"Takip {metrics['tracking_confidence'] * 100:0.0f}%",
-        (info_x, panel_y1 + 26),
-        20,
-        (220, 226, 232),
-    )
-    draw_text(
-        frame,
-        f"Göz {metrics['eye_open'] * 100:0.0f}%",
+        f"Yaş aralığı {age_label}",
         (info_x, panel_y1 + 52),
-        20,
-        (220, 226, 232),
-    )
-    draw_text(
-        frame,
-        f"Aralık {age_label}",
-        (info_x, panel_y1 + 78),
-        20,
+        22,
         (220, 226, 232),
     )
 
@@ -428,6 +562,143 @@ def _draw_top_badges(frame, mode: str, fps: float) -> None:
 
     subtitle_y = min(row_bottom + 22, frame.shape[0] - 18)
     draw_text(frame, subtitle, (20, subtitle_y - 15), 18, (238, 238, 238))
+
+
+def _draw_hud_card(
+    frame,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    accent: tuple[int, int, int],
+) -> None:
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (14, 18, 24), -1)
+    cv2.addWeighted(overlay, 0.88, frame, 0.12, 0.0, frame)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (44, 50, 58), 1)
+    cv2.rectangle(frame, (x1, y1), (x2, y1 + 4), accent, -1)
+
+
+def _challenge_label_color(label: str) -> tuple[int, int, int]:
+    for task_label, _metric_name, color in CHALLENGE_TASKS:
+        if task_label == label:
+            return color
+    return (70, 220, 125)
+
+
+def _draw_challenge_invite(frame, progress: float) -> None:
+    progress = max(0.0, min(1.0, progress))
+    card_w = min(430, frame.shape[1] - 48)
+    card_h = 132
+    x2 = frame.shape[1] - 22
+    x1 = max(x2 - card_w, 24)
+    y1 = 22
+    x2 = x1 + card_w
+    y2 = y1 + card_h
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=(255, 205, 80))
+    draw_text(frame, "DUYGU YARIŞMASI", (x1 + 18, y1 + 14), 14, (255, 205, 80))
+    draw_text(frame, "Hazır mısın?", (x1 + 18, y1 + 36), 32, (255, 255, 255))
+    draw_text(
+        frame,
+        "3 saniye gülümse, yarışma başlasın",
+        (x1 + 18, y1 + 82),
+        19,
+        (220, 226, 232),
+    )
+
+    bar_x1 = x1 + 22
+    bar_x2 = x2 - 22
+    bar_y1 = y2 - 22
+    bar_h = 10
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (58, 64, 72), -1)
+    fill_w = int((bar_x2 - bar_x1) * progress)
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), (255, 205, 80), -1)
+
+
+def _draw_challenge_active(
+    frame,
+    task_label: str,
+    task_index: int,
+    task_count: int,
+    remaining_seconds: float,
+    task_score: float,
+    color: tuple[int, int, int],
+) -> None:
+    card_w = min(430, frame.shape[1] - 48)
+    card_h = 154
+    x2 = frame.shape[1] - 22
+    x1 = max(x2 - card_w, 24)
+    y1 = 22
+    x2 = x1 + card_w
+    y2 = y1 + card_h
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=color)
+    draw_text(frame, "DUYGU YARIŞMASI", (x1 + 18, y1 + 14), 14, color)
+    draw_text(frame, task_label, (x1 + 18, y1 + 36), 32, (255, 255, 255))
+    draw_text(
+        frame,
+        f"Görev {task_index + 1}/{task_count}   •   {remaining_seconds:0.1f} sn",
+        (x1 + 18, y1 + 82),
+        18,
+        (220, 226, 232),
+    )
+    draw_text(
+        frame,
+        f"Bu tur skoru %{task_score * 100:0.0f}",
+        (x1 + 18, y1 + 108),
+        18,
+        color,
+    )
+    bar_x1 = x1 + 26
+    bar_x2 = x2 - 26
+    bar_y1 = y2 - 28
+    bar_h = 10
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (58, 64, 72), -1)
+    fill_ratio = max(0.0, min(1.0, task_score))
+    fill_w = int((bar_x2 - bar_x1) * fill_ratio)
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), color, -1)
+
+
+def _draw_challenge_result(
+    frame,
+    best_label: str,
+    best_score: float,
+    average_score: float,
+    best_color: tuple[int, int, int],
+) -> None:
+    card_w = min(430, frame.shape[1] - 48)
+    card_h = 184
+    x2 = frame.shape[1] - 22
+    x1 = max(x2 - card_w, 24)
+    y1 = 22
+    x2 = x1 + card_w
+    y2 = y1 + card_h
+
+    _draw_hud_card(frame, x1, y1, x2, y2, accent=best_color)
+    draw_text(frame, "DUYGU YARIŞMASI", (x1 + 18, y1 + 14), 14, best_color)
+    draw_text(frame, "EN İYİ MODUN", (x1 + 18, y1 + 34), 18, (220, 226, 232))
+    draw_text(
+        frame,
+        _turkish_upper(best_label),
+        (x1 + 18, y1 + 54),
+        44,
+        best_color,
+    )
+    draw_text(
+        frame,
+        f"Bu turdaki skorun %{best_score * 100:0.0f}",
+        (x1 + 18, y1 + 114),
+        22,
+        (255, 255, 255),
+    )
+    draw_text(
+        frame,
+        f"Genel ortalama %{average_score * 100:0.0f}",
+        (x1 + 18, y1 + 142),
+        18,
+        (200, 206, 214),
+    )
 
 
 def _draw_standby_card(frame) -> None:

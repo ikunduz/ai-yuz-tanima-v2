@@ -8,10 +8,16 @@ from PIL import Image, ImageDraw, ImageFont
 Anchor = Literal["lt", "mm", "mt"]
 
 FONT_CANDIDATES = (
+    "/System/Library/Fonts/Avenir Next.ttc",
+    "/System/Library/Fonts/SFNSRounded.ttf",
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Avenir.ttc",
     "/Library/Fonts/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/SFNS.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
 )
 
 
