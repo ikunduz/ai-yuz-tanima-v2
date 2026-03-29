@@ -558,9 +558,9 @@ class FaceAnalyzer:
     ) -> str:
         expressive_scores = {
             "Mutlu": metrics.get("happy", 0.0),
-            "Saskin": metrics.get("surprised", 0.0),
-            "Kizgin": metrics.get("angry", 0.0),
-            "Uzgun": metrics.get("sad", 0.0),
+            "Şaşkın": metrics.get("surprised", 0.0),
+            "Kızgın": metrics.get("angry", 0.0),
+            "Üzgün": metrics.get("sad", 0.0),
         }
         neutral_score = float(metrics.get("neutral", 0.0))
         expressive_label, expressive_score = max(

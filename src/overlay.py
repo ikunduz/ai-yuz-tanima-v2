@@ -1,4 +1,5 @@
-from typing import Iterable, List
+import time
+from typing import List
 
 import cv2
 import numpy as np
@@ -6,13 +7,23 @@ from mediapipe.tasks.python import vision
 
 try:
     from .analyzer import FaceAnalysis
+    from .text_renderer import draw_text, measure_text
 except ImportError:
     from analyzer import FaceAnalysis
+    from text_renderer import draw_text, measure_text
 
 LANDMARK_CONNECTIONS = (
     vision.FaceLandmarksConnections.FACE_LANDMARKS_TESSELATION,
     vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
 )
+
+LABEL_COLORS = {
+    "Mutlu": (70, 220, 125),
+    "Şaşkın": (75, 200, 255),
+    "Kızgın": (70, 95, 255),
+    "Üzgün": (245, 150, 80),
+    "Sakin": (205, 205, 205),
+}
 
 
 def draw_overlay(
@@ -24,124 +35,120 @@ def draw_overlay(
     canvas = frame.copy()
 
     for analysis in analyses:
+        _draw_focus_aura(canvas, analysis)
         _draw_face_box(canvas, analysis)
         _draw_expression_label(canvas, analysis)
-        # _draw_metrics_panel(canvas, analysis)  # User said only bottom values
         if draw_landmarks:
             _draw_landmarks(canvas, analysis.points)
 
     return canvas
 
 
-def _draw_expression_label(frame: np.ndarray, analysis: FaceAnalysis) -> None:
-    x_min, y_min, x_max, _ = analysis.bbox
-    label_parts = [analysis.top_label]
-    if analysis.age_label:
-        label_parts.append(analysis.age_label)
-    label = " | ".join(label_parts)
+def _label_color(label: str) -> tuple[int, int, int]:
+    return LABEL_COLORS.get(label, (205, 205, 205))
 
-    # Text appearance
-    font = cv2.FONT_HERSHEY_DUPLEX
-    scale = 0.95
-    thickness = 2
 
-    # Get text size for background box
-    (w, h), baseline = cv2.getTextSize(label, font, scale, thickness)
+def _draw_focus_aura(frame: np.ndarray, analysis: FaceAnalysis) -> None:
+    x_min, y_min, x_max, y_max = analysis.bbox
+    width = x_max - x_min
+    height = y_max - y_min
+    color = _label_color(analysis.top_label)
 
-    # Position: Center above the face box
-    label_x = x_min + (x_max - x_min) // 2 - w // 2
-    label_y = y_min - 15
-
-    # Draw background box (Neon glow style)
-    padding = 8
-    box_x1 = label_x - padding
-    box_y1 = label_y - h - padding
-    box_x2 = label_x + w + padding
-    box_y2 = label_y + padding
-
-    # Color mapping
-    colors = {
-        "Mutlu": (60, 220, 120),    # Emerald
-        "Saskin": (80, 200, 255),   # Cloud Blue
-        "Kizgin": (60, 60, 255),    # Vibrant Red
-        "Uzgun": (255, 120, 60),    # Deep Orange/Blue
-        "Sakin": (180, 180, 180),   # Muted Grey
-    }
-    color = colors.get(analysis.top_label, (180, 180, 180))
-
-    # Semi-transparent dark background
     overlay = frame.copy()
-    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0.0, frame)
-
-    # Accent line
-    cv2.line(frame, (box_x1, box_y2), (box_x2, box_y2), color, 2)
-
-    # Text
-    cv2.putText(
-        frame,
-        label,
-        (label_x, label_y),
-        font,
-        scale,
-        (255, 255, 255),
-        thickness,
+    padding_x = int(width * 0.18)
+    padding_y = int(height * 0.16)
+    cv2.ellipse(
+        overlay,
+        (x_min + width // 2, y_min + height // 2),
+        (width // 2 + padding_x, height // 2 + padding_y),
+        0.0,
+        0,
+        360,
+        color,
+        -1,
         cv2.LINE_AA,
     )
+    cv2.addWeighted(overlay, 0.08, frame, 0.92, 0.0, frame)
+
+
+def _draw_expression_label(frame: np.ndarray, analysis: FaceAnalysis) -> None:
+    x_min, y_min, x_max, _ = analysis.bbox
+    color = _label_color(analysis.top_label)
+    title = analysis.top_label.upper()
+    subtitle = f"~{analysis.age_years:0.0f} YAŞ" if analysis.age_years is not None else (
+        (analysis.age_label or "YAŞ TAHMİNİ").upper()
+    )
+
+    title_font = cv2.FONT_HERSHEY_DUPLEX
+    title_scale = 1.18
+    title_thickness = 2
+    sub_scale = 0.72
+    sub_thickness = 2
+    title_font_size = 34
+    subtitle_font_size = 22
+
+    title_w, title_h = measure_text(title, title_font_size)
+    sub_w, sub_h = measure_text(subtitle, subtitle_font_size)
+
+    card_w = max(title_w, sub_w) + 36
+    card_h = title_h + sub_h + 44
+    center_x = x_min + (x_max - x_min) // 2
+    card_x1 = max(center_x - card_w // 2, 12)
+    card_x2 = min(card_x1 + card_w, frame.shape[1] - 12)
+    card_x1 = card_x2 - card_w
+    card_y2 = max(y_min - 12, card_h + 12)
+    card_y1 = card_y2 - card_h
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (card_x1, card_y1), (card_x2, card_y2), (14, 16, 20), -1)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0.0, frame)
+
+    cv2.rectangle(frame, (card_x1, card_y1), (card_x2, card_y2), color, 2)
+    cv2.rectangle(frame, (card_x1, card_y2 - 6), (card_x2, card_y2), color, -1)
+
+    title_x = card_x1 + (card_w - title_w) // 2
+    title_y = card_y1 + 12
+    sub_x = card_x1 + (card_w - sub_w) // 2
+    sub_y = title_y + title_h + 8
+
+    draw_text(frame, title, (title_x, title_y), title_font_size, (250, 250, 250))
+    draw_text(frame, subtitle, (sub_x, sub_y), subtitle_font_size, (242, 242, 242))
 
 
 def _draw_face_box(frame: np.ndarray, analysis: FaceAnalysis) -> None:
     x_min, y_min, x_max, y_max = analysis.bbox
-    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (60, 220, 120), 2)
+    width = max(x_max - x_min, 1)
+    height = max(y_max - y_min, 1)
+    corner = max(min(width, height) // 5, 18)
+    color = _label_color(analysis.top_label)
 
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x_min, y_min), (x_max, y_max), color, -1)
+    cv2.addWeighted(overlay, 0.05, frame, 0.95, 0.0, frame)
 
-def _draw_metrics_panel(frame: np.ndarray, analysis: FaceAnalysis) -> None:
-    x_min, y_min, _, _ = analysis.bbox
-    metrics = analysis.metrics
-    rows: Iterable[tuple[str, float]] = (
-        ("Takip", metrics["tracking_confidence"]),
-        ("Goz Acikligi", metrics["eye_open"]),
-        ("Mutlu", metrics["happy"]),
-        ("Saskin", metrics["surprised"]),
-        ("Kizgin", metrics["angry"]),
-        ("Uzgun", metrics["sad"]),
-    )
+    for start, end in (
+        ((x_min, y_min), (x_min + corner, y_min)),
+        ((x_min, y_min), (x_min, y_min + corner)),
+        ((x_max, y_min), (x_max - corner, y_min)),
+        ((x_max, y_min), (x_max, y_min + corner)),
+        ((x_min, y_max), (x_min + corner, y_max)),
+        ((x_min, y_max), (x_min, y_max - corner)),
+        ((x_max, y_max), (x_max - corner, y_max)),
+        ((x_max, y_max), (x_max, y_max - corner)),
+    ):
+        cv2.line(frame, start, end, color, 3, cv2.LINE_AA)
 
-    panel_x = max(x_min - 10, 10)
-    panel_y = max(y_min - 170, 10)
-    panel_w = 280
-    panel_h = 150
+    tracking = float(analysis.metrics.get("tracking_confidence", 0.0))
+    scan_phase = (time.monotonic() * 1.7 + analysis.face_id * 0.27) % 1.0
+    scan_y = y_min + int(height * scan_phase)
+    scan_alpha = 0.18 + tracking * 0.16
+    scan_overlay = frame.copy()
+    cv2.line(scan_overlay, (x_min + 6, scan_y), (x_max - 6, scan_y), color, 2, cv2.LINE_AA)
+    cv2.addWeighted(scan_overlay, scan_alpha, frame, 1.0 - scan_alpha, 0.0, frame)
 
-    cv2.rectangle(
-        frame,
-        (panel_x, panel_y),
-        (panel_x + panel_w, panel_y + panel_h),
-        (18, 18, 18),
-        -1,
-    )
-    cv2.rectangle(
-        frame,
-        (panel_x, panel_y),
-        (panel_x + panel_w, panel_y + panel_h),
-        (80, 200, 255),
-        1,
-    )
-
-    cv2.putText(
-        frame,
-        "YUZ ANALIZI",
-        (panel_x + 12, panel_y + 22),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.6,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    y = panel_y + 48
-    for label, value in rows:
-        _draw_metric_bar(frame, label, value, panel_x + 12, y, panel_w - 24)
-        y += 22
+    center = (x_min + width // 2, y_min + height // 2)
+    radius = max(min(width, height) // 2 + 14, 28)
+    cv2.circle(frame, center, radius, color, 1, cv2.LINE_AA)
 
 
 def _draw_landmarks(frame: np.ndarray, points: np.ndarray) -> None:
@@ -149,47 +156,4 @@ def _draw_landmarks(frame: np.ndarray, points: np.ndarray) -> None:
         for connection in connection_group:
             start = tuple(points[connection.start].astype(int))
             end = tuple(points[connection.end].astype(int))
-            cv2.line(frame, start, end, (80, 220, 120), 1, cv2.LINE_AA)
-
-
-def _draw_metric_bar(
-    frame: np.ndarray,
-    label: str,
-    value: float,
-    x: int,
-    y: int,
-    width: int,
-) -> None:
-    bar_x = x + 110
-    bar_y = y - 10
-    bar_w = width - 120
-    bar_h = 10
-    filled_w = int(bar_w * max(0.0, min(1.0, value)))
-
-    cv2.putText(
-        frame,
-        label,
-        (x, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (240, 240, 240),
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60, 60, 60), -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled_w, bar_y + bar_h), (80, 200, 255), -1)
-
-
-def _draw_header(frame: np.ndarray, fps: float, face_count: int) -> None:
-    label = f"Yuz: {face_count} | FPS: {fps:.1f} | q/ESC cikis | f tam ekran"
-    cv2.rectangle(frame, (0, 0), (frame.shape[1], 36), (12, 12, 12), -1)
-    cv2.putText(
-        frame,
-        label,
-        (16, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (245, 245, 245),
-        2,
-        cv2.LINE_AA,
-    )
+            cv2.line(frame, start, end, (90, 225, 130), 1, cv2.LINE_AA)

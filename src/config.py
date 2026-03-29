@@ -37,7 +37,7 @@ class AppConfig:
     draw_landmarks: bool = True
     show_labels: bool = True
     show_header: bool = False
-    window_name: str = "AI Yuz Tanima Prototype"
+    window_name: str = "AI Yüz Tanıma Prototype"
     model_path: str = str(PROJECT_ROOT / "models" / "face_landmarker.task")
     age_enabled: bool = True
     age_backend: str = "mivolo"

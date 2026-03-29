@@ -1,3 +1,4 @@
+import math
 import platform
 import time
 from typing import Optional
@@ -9,11 +10,13 @@ try:
     from .camera import CameraSource
     from .config import DEFAULT_CONFIG
     from .overlay import draw_overlay
+    from .text_renderer import draw_text, measure_text
 except ImportError:
     from analyzer import FaceAnalysis, FaceAnalyzer
     from camera import CameraSource
     from config import DEFAULT_CONFIG
     from overlay import draw_overlay
+    from text_renderer import draw_text, measure_text
 
 
 ENGAGE_AFTER_SECONDS = 0.45
@@ -161,26 +164,24 @@ def _draw_runtime_chrome(
     face: Optional[FaceAnalysis],
     draw_landmarks: bool,
 ) -> None:
-    # Top header removed per request. Only standby card and bottom signals.
     if mode == "standby":
         _draw_standby_card(frame)
         return
 
-    # Draw bottom signal strip for calibration
+    _draw_top_badges(frame, mode, fps)
     if face is not None:
-        # Determine accent color from mode
         accent = (60, 220, 120) if mode == "tracking" else (80, 200, 255)
         _draw_signal_strip(frame, face, accent)
 
 
 def _mode_copy(mode: str) -> tuple[tuple[int, int, int], str, str]:
     if mode == "tracking":
-        return (60, 220, 120), "TAKIPTE", "Ana yuz sabitlendi"
+        return (60, 220, 120), "TAKİPTE", "Ana yüz sabitlendi"
     if mode == "acquiring":
-        return (80, 200, 255), "ALGILANIYOR", "Yuz noktalarinin takibi oturuyor"
+        return (80, 200, 255), "ALGILANIYOR", "Yüz takibi oturuyor"
     if mode == "hold":
-        return (255, 205, 80), "KISA BEKLEME", "Yuz kisa sureligine kayboldu"
-    return (180, 180, 180), "BEKLEME", "Kameranin onunde bir yuz bekleniyor"
+        return (255, 205, 80), "KISA BEKLEME", "Yüz kısa süreliğine kayboldu"
+    return (180, 180, 180), "BEKLEME", "Kameranın önünde bir yüz bekleniyor"
 
 
 def _draw_signal_strip(
@@ -191,88 +192,224 @@ def _draw_signal_strip(
     metrics = face.metrics
     age_value = f"~{face.age_years:0.0f}" if face.age_years is not None else "--"
     age_label = face.age_label or "--"
-    labels = (
-        f"Yuz {face.face_id}",
-        f"Yas {age_value}",
-        f"Aralik {age_label}",
+    panel_h = 110
+    panel_y1 = frame.shape[0] - panel_h
+    panel_y2 = frame.shape[0]
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, panel_y1), (frame.shape[1], panel_y2), (10, 12, 16), -1)
+    cv2.addWeighted(overlay, 0.84, frame, 0.16, 0.0, frame)
+    cv2.line(frame, (0, panel_y1), (frame.shape[1], panel_y1), accent, 3)
+
+    summary_w = min(360, max(frame.shape[1] // 3, 330))
+    cv2.rectangle(frame, (18, panel_y1 + 16), (18 + summary_w, panel_y2 - 16), (18, 22, 28), -1)
+    cv2.rectangle(frame, (18, panel_y1 + 16), (18 + summary_w, panel_y2 - 16), accent, 1)
+    draw_text(frame, f"YÜZ {face.face_id}", (36, panel_y1 + 20), 24, (245, 245, 245))
+    draw_text(frame, age_value, (34, panel_y1 + 50), 46, (255, 255, 255))
+    info_x = 160
+    draw_text(
+        frame,
         f"Takip {metrics['tracking_confidence'] * 100:0.0f}%",
-        f"Goz {metrics['eye_open'] * 100:0.0f}%",
-        f"Mutlu {metrics['happy'] * 100:0.0f}%",
-        f"Saskin {metrics['surprised'] * 100:0.0f}%",
-        f"Kizgin {metrics['angry'] * 100:0.0f}%",
-        f"Uzgun {metrics['sad'] * 100:0.0f}%",
+        (info_x, panel_y1 + 26),
+        20,
+        (220, 226, 232),
+    )
+    draw_text(
+        frame,
+        f"Göz {metrics['eye_open'] * 100:0.0f}%",
+        (info_x, panel_y1 + 52),
+        20,
+        (220, 226, 232),
+    )
+    draw_text(
+        frame,
+        f"Aralık {age_label}",
+        (info_x, panel_y1 + 78),
+        20,
+        (220, 226, 232),
     )
 
-    top = frame.shape[0] - 42
-    cv2.rectangle(frame, (0, top - 22), (frame.shape[1], frame.shape[0]), (12, 12, 12), -1)
-    cv2.line(frame, (0, top - 22), (frame.shape[1], top - 22), accent, 2)
-
-    x = 16
-    for label in labels:
-        cv2.putText(
-            frame,
-            label,
-            (x, top),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.54,
-            (240, 240, 240),
-            1,
-            cv2.LINE_AA,
+    meter_x = summary_w + 42
+    meter_w = frame.shape[1] - meter_x - 22
+    meter_gap = 14
+    meter_count = 4
+    meter_item_w = max((meter_w - meter_gap * (meter_count - 1)) // meter_count, 80)
+    emotions = (
+        ("Mutlu", metrics["happy"], (70, 220, 125)),
+        ("Şaşkın", metrics["surprised"], (75, 200, 255)),
+        ("Kızgın", metrics["angry"], (70, 95, 255)),
+        ("Üzgün", metrics["sad"], (245, 150, 80)),
+    )
+    for index, (label, value, color) in enumerate(emotions):
+        card_x = meter_x + index * (meter_item_w + meter_gap)
+        _draw_emotion_meter(
+            frame=frame,
+            x=card_x,
+            y=panel_y1 + 16,
+            w=meter_item_w,
+            h=panel_h - 32,
+            label=label,
+            value=float(value),
+            color=color,
         )
-        text_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.54, 1)[0][0]
-        x += text_width + 22
+
+
+def _draw_emotion_meter(
+    frame,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    label: str,
+    value: float,
+    color: tuple[int, int, int],
+) -> None:
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (18, 22, 28), -1)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 1)
+
+    draw_text(frame, label.upper(), (x + 12, y + 8), 19, (245, 245, 245))
+    cv2.putText(
+        frame,
+        f"{value * 100:0.0f}%",
+        (x + 12, y + 48),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.9,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+    bar_x1 = x + 12
+    bar_y1 = y + h - 24
+    bar_x2 = x + w - 12
+    bar_h = 12
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x2, bar_y1 + bar_h), (50, 56, 64), -1)
+    fill_w = int((bar_x2 - bar_x1) * max(0.0, min(1.0, value)))
+    cv2.rectangle(frame, (bar_x1, bar_y1), (bar_x1 + fill_w, bar_y1 + bar_h), color, -1)
+
+
+def _draw_top_badges(frame, mode: str, fps: float) -> None:
+    accent, title, subtitle = _mode_copy(mode)
+    labels = (
+        title,
+        "LOKAL",
+        "TEK YÜZ",
+        f"{fps:0.0f} FPS",
+    )
+    font_scale = 0.48
+    gap = 8
+    padding_x = 10
+    padding_y = 7
+    x = 18
+    y = 16
+    start_x = x
+    row_bottom = y
+    chip_layout = []
+
+    for index, label in enumerate(labels):
+        text_w, text_h = measure_text(label, 18)
+        baseline = 3
+        box_w = text_w + padding_x * 2
+        box_h = text_h + baseline + padding_y * 2
+        if x + box_w > frame.shape[1] - 18:
+            x = start_x
+            y = row_bottom + gap
+        chip_layout.append((index, label, x, y, box_w, box_h, text_h, baseline))
+        x += box_w + gap
+        row_bottom = max(row_bottom, y + box_h)
+
+    panel_x1 = 12
+    panel_y1 = 10
+    panel_x2 = min(max(item[2] + item[4] for item in chip_layout) + 10, frame.shape[1] - 12)
+    panel_y2 = min(row_bottom + 34, frame.shape[0] - 12)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (panel_x1, panel_y1), (panel_x2, panel_y2), (10, 12, 16), -1)
+    cv2.addWeighted(overlay, 0.62, frame, 0.38, 0.0, frame)
+
+    for index, label, chip_x, chip_y, box_w, box_h, _text_h, _baseline in chip_layout:
+        color = accent if index == 0 else (70, 78, 88)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (chip_x, chip_y), (chip_x + box_w, chip_y + box_h), (14, 16, 20), -1)
+        cv2.addWeighted(overlay, 0.82, frame, 0.18, 0.0, frame)
+        cv2.rectangle(frame, (chip_x, chip_y), (chip_x + box_w, chip_y + box_h), color, 1)
+        draw_text(frame, label, (chip_x + padding_x, chip_y + padding_y - 1), 18, (245, 245, 245))
+
+    subtitle_y = min(row_bottom + 22, frame.shape[0] - 18)
+    draw_text(frame, subtitle, (20, subtitle_y - 15), 18, (238, 238, 238))
 
 
 def _draw_standby_card(frame) -> None:
+    phase = time.monotonic()
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (6, 12, 18), -1)
-    cv2.addWeighted(overlay, 0.36, frame, 0.64, 0.0, frame)
+    cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (6, 10, 16), -1)
+    cv2.addWeighted(overlay, 0.48, frame, 0.52, 0.0, frame)
 
     center_x = frame.shape[1] // 2
     center_y = frame.shape[0] // 2
+    pulse = 0.5 + 0.5 * (1.0 + math.sin(phase * 2.2)) / 2.0
 
-    cv2.circle(frame, (center_x, center_y - 76), 74, (80, 200, 255), 2, cv2.LINE_AA)
-    cv2.circle(frame, (center_x, center_y - 76), 6, (80, 200, 255), -1, cv2.LINE_AA)
+    for radius, color, thickness in (
+        (86 + int(pulse * 8), (80, 200, 255), 2),
+        (116 + int(pulse * 12), (60, 220, 120), 1),
+        (148 + int(pulse * 16), (245, 150, 80), 1),
+    ):
+        cv2.circle(frame, (center_x, center_y - 92), radius, color, thickness, cv2.LINE_AA)
+    cv2.circle(frame, (center_x, center_y - 92), 8, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(frame, (center_x, center_y - 92), 22, (80, 200, 255), 2, cv2.LINE_AA)
 
-    _draw_centered_text(frame, "YAPAY ZEKA AYNASI", center_y + 10, 1.05, (255, 255, 255), 2)
+    _draw_centered_text(frame, "YAPAY ZEKA AYNASI", center_y + 4, 32, (255, 255, 255))
     _draw_centered_text(
         frame,
-        "Kameranin onune gecin",
-        center_y + 48,
-        0.78,
+        "Yüzünü tarat, duygunu gör",
+        center_y + 44,
+        24,
         (220, 220, 220),
-        2,
     )
     _draw_centered_text(
         frame,
-        "Tek baskin yuz izlenir | Tamamen lokal calisir",
-        center_y + 84,
-        0.58,
+        "Tek baskın yüz izlenir  |  Tamamen lokal çalışır",
+        center_y + 82,
+        17,
         (170, 205, 230),
-        1,
     )
+    _draw_standby_chips(frame, center_y + 130)
+
+
+def _draw_standby_chips(frame, y: int) -> None:
+    chips = (
+        ("DUYGU", (70, 220, 125)),
+        ("YAŞ", (80, 200, 255)),
+        ("CANLI", (245, 150, 80)),
+    )
+    total_w = 0
+    chip_sizes = []
+    for label, _ in chips:
+        text_w, text_h = measure_text(label, 20)
+        baseline = 3
+        width = text_w + 28
+        chip_sizes.append((label, width, text_h + baseline + 14))
+        total_w += width
+    total_w += (len(chips) - 1) * 14
+
+    x = max((frame.shape[1] - total_w) // 2, 18)
+    for (label, color), (_, width, height) in zip(chips, chip_sizes):
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x, y), (x + width, y + height), (12, 16, 22), -1)
+        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0.0, frame)
+        cv2.rectangle(frame, (x, y), (x + width, y + height), color, 1)
+        draw_text(frame, label, (x + 14, y + 8), 20, (245, 245, 245))
+        x += width + 14
 
 
 def _draw_centered_text(
     frame,
     text: str,
     y: int,
-    scale: float,
+    font_size: int,
     color: tuple[int, int, int],
-    thickness: int,
 ) -> None:
-    (width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    width, height = measure_text(text, font_size)
     x = max((frame.shape[1] - width) // 2, 12)
-    cv2.putText(
-        frame,
-        text,
-        (x, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
+    draw_text(frame, text, (x, y - height), font_size, color)
 
 
 if __name__ == "__main__":
