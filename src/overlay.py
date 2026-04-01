@@ -31,13 +31,15 @@ def draw_overlay(
     analyses: List[FaceAnalysis],
     fps: float,
     draw_landmarks: bool,
+    show_labels: bool = True,
 ) -> np.ndarray:
     canvas = frame.copy()
 
     for analysis in analyses:
         _draw_focus_aura(canvas, analysis)
         _draw_face_box(canvas, analysis)
-        _draw_expression_label(canvas, analysis)
+        if show_labels:
+            _draw_expression_label(canvas, analysis)
         if draw_landmarks:
             _draw_landmarks(canvas, analysis.points)
 

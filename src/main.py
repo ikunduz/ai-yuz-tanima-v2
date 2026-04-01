@@ -11,6 +11,7 @@ try:
     from .camera import CameraSource
     from .config import DEFAULT_CONFIG
     from .duo_challenge import DuoChallengeManager
+    from .kids_challenge import KidsChallengeManager
     from .overlay import draw_overlay
     from .text_renderer import draw_text, measure_text
 except ImportError:
@@ -18,6 +19,7 @@ except ImportError:
     from camera import CameraSource
     from config import DEFAULT_CONFIG
     from duo_challenge import DuoChallengeManager
+    from kids_challenge import KidsChallengeManager
     from overlay import draw_overlay
     from text_renderer import draw_text, measure_text
 
@@ -167,6 +169,7 @@ def main() -> None:
     last_face_track_id: Optional[int] = None
 
     duo_manager = DuoChallengeManager(config)
+    kids_manager = KidsChallengeManager(config)
 
     cv2.namedWindow(config.window_name, cv2.WINDOW_NORMAL)
 
@@ -253,8 +256,11 @@ def main() -> None:
                     last_face_center = None
                     last_face_track_id = None
 
-            # ── Duo challenge update ──
-            duo_manager.update(analyses, now)
+            # ── Duo & Kids challenge updates ──
+            if not kids_manager.is_active:
+                duo_manager.update(analyses, now)
+            if not duo_manager.is_active:
+                kids_manager.update(analyses, now)
 
             challenge_invite_eligible = (
                 challenge_state == "idle"
@@ -262,6 +268,7 @@ def main() -> None:
                 and primary_face is not None
                 and primary_face.age_years is not None
                 and not duo_manager.blocks_solo
+                and not kids_manager.blocks_solo
                 and (
                     challenge_cooldown_until is None
                     or now >= challenge_cooldown_until
@@ -401,15 +408,37 @@ def main() -> None:
                     smile_hold_started_at = None
                     tilt_hold_started_at = None
 
-            if challenge_state == "countdown" or (duo_manager.is_active and duo_manager.state in ("intro", "countdown")):
+            challenge_invite_visible = (
+                challenge_state == "idle"
+                and status_face is not None
+                and challenge_invite_started_at is not None
+                and now - challenge_invite_started_at >= CHALLENGE_INVITE_DELAY_SECONDS
+            )
+            show_special_ui = (
+                challenge_invite_visible
+                or challenge_state != "idle"
+                or duo_manager.is_active
+                or kids_manager.is_active
+            )
+            show_face_labels = not show_special_ui
+
+            if challenge_state == "countdown" or (duo_manager.is_active and duo_manager.state in ("intro", "countdown")) or (kids_manager.is_active and kids_manager.state in ("intro", "countdown")):
                 output = frame.copy()
-            elif duo_manager.is_active and duo_manager.state == "active":
-                # During duo active: show both faces in overlay
+            elif duo_manager.is_active:
                 output = draw_overlay(
                     frame=frame,
-                    analyses=analyses[:2],
+                    analyses=duo_manager.overlay_analyses,
                     fps=display_fps,
                     draw_landmarks=draw_landmarks,
+                    show_labels=show_face_labels,
+                )
+            elif kids_manager.is_active:
+                output = draw_overlay(
+                    frame=frame,
+                    analyses=kids_manager.overlay_analyses,
+                    fps=display_fps,
+                    draw_landmarks=draw_landmarks and bool(kids_manager.overlay_analyses),
+                    show_labels=show_face_labels,
                 )
             else:
                 output = draw_overlay(
@@ -417,20 +446,16 @@ def main() -> None:
                     analyses=[face_for_overlay] if face_for_overlay is not None else [],
                     fps=display_fps,
                     draw_landmarks=draw_landmarks and face_for_overlay is not None,
+                    show_labels=show_face_labels,
                 )
-                _draw_runtime_chrome(
-                    frame=output,
-                    mode=mode,
-                    fps=display_fps,
-                    face=status_face,
-                    draw_landmarks=draw_landmarks,
-                )
-            challenge_invite_visible = (
-                challenge_state == "idle"
-                and status_face is not None
-                and challenge_invite_started_at is not None
-                and now - challenge_invite_started_at >= CHALLENGE_INVITE_DELAY_SECONDS
-            )
+                if not show_special_ui:
+                    _draw_runtime_chrome(
+                        frame=output,
+                        mode=mode,
+                        fps=display_fps,
+                        face=status_face,
+                        draw_landmarks=draw_landmarks,
+                    )
             if challenge_invite_visible:
                 smile_progress = 0.0
                 if smile_hold_started_at is not None:
@@ -492,6 +517,10 @@ def main() -> None:
             # ── Duo challenge overlay ──
             if duo_manager.is_active:
                 duo_manager.draw(output, now)
+
+            # ── Kids challenge overlay ──
+            if kids_manager.is_active:
+                kids_manager.draw(output, now)
 
             cv2.imshow(config.window_name, output)
             if target_frame_time > 0.0:

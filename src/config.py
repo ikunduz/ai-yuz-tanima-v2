@@ -85,6 +85,15 @@ class AppConfig:
     duo_task_seconds: float = 5.0
     duo_result_seconds: float = 10.0
     duo_cooldown_seconds: float = 15.0
+    # ── Kids challenge (Sevimli Hayvanlar) ────────────────
+    kids_max_age: int = 12
+    kids_invite_delay_seconds: float = 6.0
+    kids_smile_threshold: float = 0.45
+    kids_smile_hold_seconds: float = 2.0
+    kids_countdown_seconds: float = 4.0
+    kids_task_seconds: float = 6.0
+    kids_result_seconds: float = 10.0
+    kids_cooldown_seconds: float = 20.0
 
 
 DEFAULT_CONFIG = AppConfig()

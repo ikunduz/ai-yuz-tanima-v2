@@ -79,6 +79,10 @@ class DuoChallengeManager:
     def blocks_solo(self) -> bool:
         return self.state != "idle"
 
+    @property
+    def overlay_analyses(self) -> List[FaceAnalysis]:
+        return [face for face in (self._p1, self._p2) if face is not None]
+
     def update(self, analyses: List[FaceAnalysis], now: float) -> None:
         handler = {
             "idle": self._tick_idle,

@@ -703,11 +703,10 @@ class FaceAnalyzer:
         age_years: float,
         aligned_crop: Optional[np.ndarray],
     ) -> float:
-        if getattr(self.age_estimator, "backend_name", "") != "openvino":
-            return normalize_age_years(age_years, min_age=0.0, max_age=100.0)
         calibrated = age_years + self.config.age_bias_years
-        calibrated += self._gray_hair_bonus(aligned_crop)
-        return normalize_age_years(calibrated, min_age=18.0, max_age=75.0)
+        if getattr(self.age_estimator, "backend_name", "") == "openvino":
+            calibrated += self._gray_hair_bonus(aligned_crop)
+        return normalize_age_years(calibrated, min_age=0.0, max_age=100.0)
 
     def _gray_hair_bonus(self, aligned_crop: Optional[np.ndarray]) -> float:
         if aligned_crop is None or aligned_crop.size == 0:
