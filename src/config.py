@@ -11,7 +11,7 @@ class AppConfig:
     frame_width: int = 1280
     frame_height: int = 720
     target_render_fps: float = 30.0
-    max_faces: int = 1
+    max_faces: int = 2
     min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
     smoothing_alpha: float = 0.35
@@ -76,6 +76,15 @@ class AppConfig:
     age_stability_max_motion: float = 0.055
     age_stability_max_yaw_ratio: float = 0.14
     age_stability_max_roll_degrees: float = 10.0
+    # ── Duo challenge ───────────────────────────────────
+    duo_smile_threshold: float = 0.50
+    duo_smile_hold_seconds: float = 2.0
+    duo_detection_seconds: float = 5.0
+    duo_intro_seconds: float = 5.0
+    duo_countdown_seconds: float = 5.0
+    duo_task_seconds: float = 5.0
+    duo_result_seconds: float = 10.0
+    duo_cooldown_seconds: float = 15.0
 
 
 DEFAULT_CONFIG = AppConfig()
