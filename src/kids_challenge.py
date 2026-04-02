@@ -2,6 +2,8 @@
 
 import math
 import os
+import sys
+from pathlib import Path
 from typing import List, Optional
 
 import cv2
@@ -60,14 +62,28 @@ class KidsChallengeManager:
 
     def _load_images(self) -> None:
         self._images = {}
-        assets_dir = os.path.join(os.path.dirname(__file__), "..", "assets", "kids")
+        module_dir = Path(__file__).resolve().parent
+        assets_candidates = [
+            module_dir.parent / "assets" / "kids",
+            module_dir.parents[1] / "Resources" / "assets" / "kids",
+            Path(getattr(sys, "_MEIPASS", module_dir.parent)) / "assets" / "kids",
+        ]
+
+        assets_dir = None
+        for candidate in assets_candidates:
+            if candidate.exists():
+                assets_dir = candidate
+                break
+        if assets_dir is None:
+            return
+
         for animal, filename in [
             ("Köpek", "happy_dog.png"),
             ("Baykuş", "surprised_owl.png"),
             ("Aslan", "angry_lion.png"),
             ("Kedicik", "sad_cat.png"),
         ]:
-            path = os.path.join(assets_dir, filename)
+            path = str(assets_dir / filename)
             img = cv2.imread(path, cv2.IMREAD_COLOR)
             if img is not None:
                 self._images[animal] = img

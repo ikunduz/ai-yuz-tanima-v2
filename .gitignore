@@ -9,5 +9,7 @@ node_modules/
 dist/
 build/
 *.log
+*.spec
+.pyinstaller-bundle-data/
 models/age-gender-recognition-retail-0013/
 models/mivolo_v2/
