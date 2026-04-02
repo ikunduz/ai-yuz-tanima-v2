@@ -22,16 +22,23 @@ class CameraSource:
         self._latest_frame = None
 
     def open(self) -> None:
-        if self.capture is None:
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            if self.capture is not None:
+                self.capture.release()
+                self.capture = None
+
             self.capture = self._open_capture()
+            if self.capture.isOpened():
+                self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
+                self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
+                self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self._start_reader()
+                return
 
-        if not self.capture.isOpened():
-            raise RuntimeError("Camera could not be opened.")
+            time.sleep(0.25)
 
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self._start_reader()
+        raise RuntimeError("Camera could not be opened.")
 
     def _open_capture(self):
         backends = []

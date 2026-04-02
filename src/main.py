@@ -164,6 +164,7 @@ def main() -> None:
     statue_live_score = 0.0
     statue_score_total = 0.0
     statue_score_samples = 0
+    empty_frame_started_at: Optional[float] = None
     last_face_center: Optional[tuple[float, float]] = None
     last_face_scale = 1.0
     last_face_track_id: Optional[int] = None
@@ -181,7 +182,16 @@ def main() -> None:
             loop_started_at = time.monotonic()
             frame = camera.read()
             if frame is None:
-                raise RuntimeError("Camera returned an empty frame.")
+                if empty_frame_started_at is None:
+                    empty_frame_started_at = loop_started_at
+                elif loop_started_at - empty_frame_started_at >= 5.0:
+                    raise RuntimeError(
+                        "Camera acildi ama goruntu gelmedi. "
+                        "Kamera baska bir uygulama tarafindan kullaniliyor olabilir."
+                    )
+                time.sleep(0.02)
+                continue
+            empty_frame_started_at = None
 
             if config.mirror_preview:
                 frame = cv2.flip(frame, 1)
