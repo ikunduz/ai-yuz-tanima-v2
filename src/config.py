@@ -53,7 +53,7 @@ class AppConfig:
         / "FP16"
         / "age-gender-recognition-retail-0013.xml"
     )
-    age_inference_interval_ms: int = 320
+    age_inference_interval_ms: int = 200
     age_smoothing_alpha: float = 0.22
     age_min_face_width: int = 84
     age_crop_padding_ratio: float = 0.18
@@ -65,10 +65,10 @@ class AppConfig:
     age_body_above_face_scale: float = 1.15
     age_body_below_face_scale: float = 4.8
     age_bias_years: float = 0.0
-    age_history_size: int = 10
-    age_history_trim: int = 2
+    age_history_size: int = 6
+    age_history_trim: int = 1
     gray_hair_bonus_max_years: float = 0.0
-    age_stability_required_frames: int = 3
+    age_stability_required_frames: int = 2
     age_stability_min_tracking_confidence: float = 0.82
     age_stability_min_presence: float = 0.55
     age_stability_max_expression: float = 0.22
