@@ -37,6 +37,9 @@ APP_TARGETS = (
     ("AI Yuz Tanima", "app_real.py", "com.ikunduz.aiyuztanima"),
     ("AI Yuz Tanima Demo", "app_demo.py", "com.ikunduz.aiyuztanima.demo"),
 )
+CAMERA_USAGE_DESCRIPTION = (
+    "Bu uygulama yuz takibi ve cocuk challenge modlari icin kamerayi kullanir."
+)
 
 
 def _add_data_arg(source: Path, destination: str) -> str:
@@ -65,6 +68,25 @@ def _prepare_stage_dir() -> Path:
         )
 
     return STAGE_DIR
+
+
+def _configure_bundle_metadata(app_path: Path) -> None:
+    info_plist = app_path / "Contents" / "Info.plist"
+    subprocess.run(
+        [
+            "plutil",
+            "-replace",
+            "NSCameraUsageDescription",
+            "-string",
+            CAMERA_USAGE_DESCRIPTION,
+            str(info_plist),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", str(app_path)],
+        check=True,
+    )
 
 
 def _build_app(name: str, entry_script: str, bundle_id: str) -> None:
@@ -108,6 +130,7 @@ def _build_app(name: str, entry_script: str, bundle_id: str) -> None:
 
     command.append(str(ROOT / entry_script))
     subprocess.run(command, check=True, cwd=ROOT)
+    _configure_bundle_metadata(DIST_DIR / f"{name}.app")
 
 
 def main() -> None:
