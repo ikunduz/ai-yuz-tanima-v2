@@ -42,6 +42,11 @@ class CameraSource:
 
     def _open_capture(self):
         backends = []
+        if platform.system() == "Windows":
+            if hasattr(cv2, "CAP_DSHOW"):
+                backends.append(cv2.CAP_DSHOW)
+            if hasattr(cv2, "CAP_MSMF"):
+                backends.append(cv2.CAP_MSMF)
         if platform.system() == "Darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
             backends.append(cv2.CAP_AVFOUNDATION)
         backends.append(None)
