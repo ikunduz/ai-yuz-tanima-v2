@@ -47,19 +47,28 @@ class CameraSource:
                 backends.append(cv2.CAP_DSHOW)
             if hasattr(cv2, "CAP_MSMF"):
                 backends.append(cv2.CAP_MSMF)
-        if platform.system() == "Darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
+        elif platform.system() == "Darwin" and hasattr(cv2, "CAP_AVFOUNDATION"):
             backends.append(cv2.CAP_AVFOUNDATION)
         backends.append(None)
 
-        for backend in backends:
-            capture = (
-                cv2.VideoCapture(self.config.camera_index, backend)
-                if backend is not None
-                else cv2.VideoCapture(self.config.camera_index)
-            )
-            if capture.isOpened():
-                return capture
-            capture.release()
+        indices = [self.config.camera_index]
+        for fallback in (0, 1, 2):
+            if fallback not in indices:
+                indices.append(fallback)
+
+        for index in indices:
+            for backend in backends:
+                capture = (
+                    cv2.VideoCapture(index, backend)
+                    if backend is not None
+                    else cv2.VideoCapture(index)
+                )
+                if capture.isOpened():
+                    ok, _ = capture.read()
+                    if ok:
+                        self.config.camera_index = index
+                        return capture
+                capture.release()
 
         return cv2.VideoCapture()
 

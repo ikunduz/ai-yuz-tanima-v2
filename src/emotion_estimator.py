@@ -9,6 +9,11 @@ except ImportError:  # pragma: no cover - handled at runtime
     EmotiEffLibRecognizer = None
 
 try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
     from .config import AppConfig
 except ImportError:
     from config import AppConfig
@@ -47,10 +52,17 @@ class EmotiEffLibEmotionEstimator(BaseEmotionEstimator):
                 "EmotiEffLib is not installed. Run `pip install -r requirements.txt` first."
             )
 
+        device_name = "cpu"
+        if torch is not None:
+            if torch.cuda.is_available():
+                device_name = "cuda"
+            elif torch.backends.mps.is_available():
+                device_name = "mps"
+
         self.recognizer = EmotiEffLibRecognizer(
             engine=config.emotion_emotiefflib_engine,
             model_name=config.emotion_emotiefflib_model_name,
-            device="cpu",
+            device=device_name,
         )
         self.idx_to_emotion_class = getattr(self.recognizer, "idx_to_emotion_class", {})
 

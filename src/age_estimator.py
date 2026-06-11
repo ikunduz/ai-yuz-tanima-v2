@@ -282,6 +282,8 @@ class MiVoloAgeEstimator(BaseAgeEstimator):
         normalized = preference.lower()
         if normalized != "auto":
             return normalized
+        if torch is not None and torch.cuda.is_available():
+            return "cuda"
         if torch is not None and torch.backends.mps.is_available():
             return "mps"
         return "cpu"

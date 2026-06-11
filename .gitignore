@@ -13,3 +13,11 @@ build/
 .pyinstaller-bundle-data/
 models/age-gender-recognition-retail-0013/
 models/mivolo_v2/
+
+# Local competition/report artifacts
+Pafta_1_Konsept_Clean.png
+Pafta_2_Uniteler_Clean.png
+TUBITAK_Basvuru_Raporu.md
+extracted_pdfs.txt
+pdf_text.txt
+rapor_taslak.md
